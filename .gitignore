@@ -1,0 +1,6 @@
+
+*.safetensors
+models/token_list
+__pycache__/
+*.pyc
+.env
