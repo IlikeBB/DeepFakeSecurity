@@ -7,7 +7,8 @@ from tqdm.auto import tqdm
 
 
 def load_encoder(args):
-    tqdm.write(f"[DINOv3] 載入模型至 {args.device}")
+    if not getattr(args, "quiet", False):
+        tqdm.write(f"[DINOv3] 載入模型至 {args.device}")
     from transformers import AutoImageProcessor, AutoModel
 
     processor = AutoImageProcessor.from_pretrained(args.model_path, local_files_only=True)

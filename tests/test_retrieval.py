@@ -7,12 +7,79 @@ from unittest.mock import patch
 import numpy as np
 from PIL import Image
 
-from script.bank_data import image_records, read_json, save_array, write_json
+from script.bank_data import image_records, read_json, save_array, sha256, write_json
 from script.bank_retrieval import build, evaluate, foreground_patches, load_index
-from script.retrieval import main
+from script.retrieval import main, parse_args
 
 
 class RetrievalTests(unittest.TestCase):
+    def test_attention_evaluation_reports_three_methods_and_reference_evidence(self):
+        from safetensors.torch import save_file
+        from script.bank_attention import CrossAttention
+        with tempfile.TemporaryDirectory() as tmp:
+            plan, args, bank, cache, output = self.fixture(Path(tmp))
+            args.method = "cross_attention"
+            args.attention = dict(neighbors=2, temperature=.07, hidden=4, heads=2)
+            build(plan, args, bank, output)
+            checkpoint = bank / "attention.safetensors"
+            save_file(CrossAttention(2, 4, 2).state_dict(), str(checkpoint))
+            write_json(output / "stage1/attention.json", dict(
+                checkpoint=str(checkpoint), checkpoint_sha256=sha256(checkpoint),
+                retrieval_sha256=sha256(output / "stage1/retrieval.json"), dimensions=2, config=args.attention))
+            evaluate(plan, args, bank, cache, output)
+            report = read_json(output / "stage2/comparison.json")
+            self.assertEqual(set(report["methods"]), {"nearest", "topk", "cross_attention"})
+            self.assertTrue(all(item["auroc"] == 1. for item in report["methods"].values()))
+            fake = read_json(output / "stage2/evaluation_scores.json")[1]
+            self.assertEqual(fake["matches"][0]["cosine_similarity"], 0.)
+            with np.load(fake["patch_matches"]) as matches:
+                self.assertEqual(matches["candidate_ids"].shape, (4, 2))
+                np.testing.assert_allclose(matches["weights"].sum(-1), 1.)
+                self.assertEqual(matches["query_patch_ids"].tolist(), [0, 1, 2, 3])
+
+    def test_main_uses_raw_features_and_only_exports_previews_when_requested(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plan, fixture_args, bank, cache, output = self.fixture(root)
+            args = parse_args(["--exper", "FB", "--gpus", "--stage", "all"])
+            vars(args).update(vars(fixture_args), results_dir=str(root / "outputs"), export_previews=False, method="nearest")
+            model = root / "model"
+            model.mkdir()
+            for name in ("model.safetensors", "config.json", "preprocessor_config.json"):
+                (model / name).write_bytes(b"fixture fingerprint")
+            labels = root / "labels.csv"
+            labels.write_text("fixture labels")
+            args.model_path, args.label_csv = str(model), str(labels)
+            (bank / "bank_config.json").unlink()
+            (bank / "splits.json").unlink()
+            with patch("script.retrieval.parse_args", return_value=args), \
+                 patch("script.retrieval.prepare_flat_plan", return_value=plan), \
+                 patch("script.retrieval.extract_roles"), \
+                 patch("script.bank_export.build_bank") as preview:
+                main([])
+                preview.assert_not_called()
+                info, _, arrays = load_index(plan, bank, output)
+                self.assertNotIn("alignment", info)
+                np.testing.assert_array_equal(arrays["features"], np.tile([1, 0], (4, 1)))
+                self.assertEqual(read_json(output / "stage2/metrics.json")["image"]["auroc"], 1.)
+                # 完成索引後仍可補預覽，不改動檢索設定或重新建立索引。
+                completion = (output / "stage1/retrieval.json").read_bytes()
+                args.export_previews, args.stage = True, "stage1"
+                main([])
+                preview.assert_called_once_with(plan, args, bank)
+                self.assertEqual((output / "stage1/retrieval.json").read_bytes(), completion)
+
+    def test_rejects_old_aligned_index_without_rewriting_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plan, args, bank, _, output = self.fixture(Path(tmp))
+            build(plan, args, bank, output)
+            path = output / "stage1/retrieval.json"
+            write_json(path, dict(read_json(path), alignment={"loss_type": "asa"}))
+            original = path.read_bytes()
+            with self.assertRaisesRegex(ValueError, "已移除的文字對齊"):
+                load_index(plan, bank, output)
+            self.assertEqual(path.read_bytes(), original)
+
     def fixture(self, root):
         bank, cache, output = root / "normal/FB", root / "normal/FB/cache", root / "outputs/FB"
         bank.mkdir(parents=True)

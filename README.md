@@ -1,20 +1,74 @@
 # DeepFakeSecurity
 
+## ATT_DEMO：real bank 的 cross-attention 實驗
+
+在 `utils/config.yaml` 的 `retrieval` 管理設定，啟動方式不變：
+
+```bash
+bash run.sh all
+# 或分開執行 bash run.sh stage1、bash run.sh stage2
+```
+
+目前實驗名稱為使用者指定的 `ATT_DEMO`，`method: cross_attention`。
+三種模式為 `nearest`（原始 1-NN）、`topk`（cosine softmax 加權正常參考）、
+`cross_attention`（可訓練的多頭正常參考加權）。更改模式或模型設定時另取實驗名稱。
+CLI 可用 `--method` 覆寫；通常只需修改 YAML。
+
+Stage 1 凍結 DINOv3，提取 real 前景 patch 並儲存原始檢索庫。
+Cross-attention 只訓練 Q/K 投影：預設 Top-16 候選、128 維投影、4 heads；
+每個 head 對完整、固定的 DINO values 分配權重，再平均各 head 的重建。
+因此輸出是 real 候選向量的凸組合；沒有 query residual、可訓練 V 或輸出 decoder。
+這是受限的 multi-head cross-attention，並非標準完整 Transformer block。
+
+Bank real 內按來源家族分出 20% validation。訓練與驗證的候選 bank **只含 train 家族**，
+訓練 query 再排除自身整個來源家族；fake、calibration、evaluation 都不參與訓練。
+每張 real 最多抽 32 個 patch 作 query，加入輕微噪聲，最小化與乾淨 DINO 特徵的 cosine 重建誤差。
+最高 30 epochs，real validation loss 連續 5 輪未改善即 early stop，Stage 2 載入最佳權重。
+可在 `retrieval.attention` 修改 `epochs`、`patience`、`batch_size`、`neighbors` 等設定。
+
+Stage 2 以完整 bank real（包含內部 real validation）作正常參考，
+在同一次 Top-K 搜尋同時計算 1-NN、固定 Top-K 加權及 cross-attention 重建誤差。
+每張圖取最大 10% patch 誤差平均；每種方法分別以獨立 real calibration 的 99 百分位設門檻。
+此比較不自動依 Stage 2 AUC 選模；既有 evaluation 已多次查看，應視為開發比較，非全新最終測試。
+
+多 GPU 共用一列提取／候選搜尋／Stage 2 進度，訓練使用 DataParallel 並覆用同一列 tqdm。
+`export_previews: false` 預設略過 PCA／JPG 視覺化，改成 `true` 後重跑 Stage 1 可補齊。
+舊 CLIP／ASA 分支仍維持移除，原始 DINO NPY 與過去實驗結果保留。
+
+```text
+RAG/normal/ATT_DEMO/
+  <來源分包>/<影片>/        # 原始 DINO NPY
+  retrieval/               # real 前景特徵、來源編號、patch 編號
+  attention/model.safetensors
+  cache/calibration/、cache/evaluation/
+outputs/feature_bank/ATT_DEMO/
+  stage1/attention.json           # 設定、訓練／驗證家族、最佳 epoch、權重及索引雜湊
+  stage1/attention_history.json   # train／validation loss、未改善輪數
+  stage2/metrics.json             # 當前方法指標及三種方法比較
+  stage2/comparison.json          # 各方法 AUROC、AP、FPR、TPR 與獨立校準門檻
+  stage2/*/patch_matches/*.npz    # 候選 bank IDs、權重、各方法誤差與 query patch IDs
+```
+
+匹配 JSON 的 `cosine_similarity`／`distance` 仍指最相似 real patch；
+`anomaly_distance` 才是當前評分方法的 patch 誤差。
+`reference_patch_ids`／`reference_weights` 可追溯重建所用的全部候選；NPZ 中權重是當前方法的權重。
+Stage 1 允許續接已有 NPY 與索引；完整 attention 權重驗證後沿用，未完成的訓練從頭開始。
+
 ## 目前啟動方式：FB_01 real feature bank 相似度檢索
 
 ```bash
 cd /ssd8/chihyu/Project/DeepFakeSecurity
-# Stage 1：多 GPU 提取 real patch，建立檢索索引與每支影片的 JPG 預覽
-bash run.sh stage1 --exper FB_01 --workers 16 --gpus 4 5 6
+# Stage 1：多 GPU 提取 real patch，建立檢索索引；JPG 預覽由 YAML 選用
+bash run.sh stage1 --exper FB_01 --method nearest --workers 16 --gpus 4 5 6
 # Stage 1 完成後，使用相同實驗名稱執行 Stage 2
-bash run.sh stage2 --exper FB_01 --workers 16 --gpus 4 5 6
+bash run.sh stage2 --exper FB_01 --method nearest --workers 16 --gpus 4 5 6
 ```
 
 入口會自動啟用 `pt230`，再執行 `main.py --task bank-retrieval`。
 參數集中在 `utils/config.yaml` 的 `retrieval`；圖片、標籤、模型路徑沿用現有 YAML 設定。
 尚未提取特徵也能直接開始。`--batch-size` 是每張 GPU 的提取 batch，預設 8。
 每張 GPU 各有模型／搜尋 worker；`--workers` 是所有 GPU 共用的圖片與 NPY 讀取執行緒上限。
-CPU 模式加空的 `--gpus`。只檢查資料切分可先執行 `bash run.sh stage1 --exper FB_01 --stage prepare`。
+CPU 模式加空的 `--gpus`。只檢查原始 FB_01 資料切分可執行 `bash run.sh stage1 --exper FB_01 --method nearest --stage prepare`。
 
 流程固定 DINOv3，不訓練分類器：每個前景 patch 查詢 real bank 的 cosine 最近鄰，
 以 `1 - similarity` 作距離，最高 10% 距離平均為圖片異常分數。
@@ -25,7 +79,7 @@ CPU 模式加空的 `--gpus`。只檢查資料切分可先執行 `bash run.sh st
 
 ```text
 RAG/normal/FB_01/
-  <來源分包>/<影片>/           # real NPY 與 preview.jpg
+  <來源分包>/<影片>/           # real NPY；選用 preview.jpg
   retrieval/                  # real 特徵矩陣、來源編號、patch 編號
   cache/calibration/          # 校準查詢特徵，不放入檢索索引
   cache/evaluation/           # 測試查詢特徵，不放入檢索索引

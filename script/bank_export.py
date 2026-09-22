@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 import torch
+from tqdm.auto import tqdm
 
 from script.bank_data import image_records, read_json, save_array, write_json
 from script.bank_encoder import encode, load_encoder
@@ -63,30 +64,32 @@ def build_bank(plan, args, root):
         record["feature_path"] = relative.as_posix()
         previews.setdefault(relative.parent, record)
     model = processor = None
-    for start in range(0, len(records), args.batch_size):
-        pending = []
-        for record in records[start:start + args.batch_size]:
-            path = root / record["feature_path"]
-            if path.with_suffix(".json").exists():
-                load_feature(root, record)
-            else:
-                pending.append(record)
-        if pending:
-            if model is None:
-                model, processor = load_encoder(args)
-            _, features = encode([r["image_path"] for r in pending], model, processor, args)
-            for record, feature in zip(pending, features):
+    with tqdm(total=len(records), desc="real NPY", unit="image", dynamic_ncols=True) as progress:
+        for start in range(0, len(records), args.batch_size):
+            batch = records[start:start + args.batch_size]
+            pending = []
+            for record in batch:
                 path = root / record["feature_path"]
-                path.parent.mkdir(parents=True, exist_ok=True)
-                save_array(path, feature)
-                write_json(path.with_suffix(".json"), {"image": record, "shape": list(feature.shape),
-                                                       "dtype": str(feature.dtype)})
-        print(f"[real NPY] {min(start + args.batch_size, len(records))}/{len(records)}", flush=True)
+                if path.with_suffix(".json").exists():
+                    load_feature(root, record)
+                else:
+                    pending.append(record)
+            if pending:
+                if model is None:
+                    model, processor = load_encoder(args)
+                _, features = encode([r["image_path"] for r in pending], model, processor, args)
+                for record, feature in zip(pending, features):
+                    path = root / record["feature_path"]
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    save_array(path, feature)
+                    write_json(path.with_suffix(".json"), {"image": record, "shape": list(feature.shape),
+                                                           "dtype": str(feature.dtype)})
+            progress.update(len(batch))
     del model, processor
     projection_path = root / "visualization.json"
     if not projection_path.exists():
         indices = np.linspace(0, len(records) - 1, min(args.pca_images, len(records)), dtype=int)
-        samples = [load_feature(root, records[i]) for i in indices]
+        samples = [load_feature(root, records[i]) for i in tqdm(indices, desc="讀取 PCA 樣本", unit="image", dynamic_ncols=True)]
         values = torch.from_numpy(np.concatenate([f.reshape(-1, f.shape[-1]) for f in samples]).astype(np.float32))
         mean = values.mean(0)
         torch.manual_seed(args.seed)
@@ -98,7 +101,7 @@ def build_bank(plan, args, root):
                    "low": np.quantile(colors, .01, axis=0).tolist(),
                    "high": np.quantile(colors, .99, axis=0).tolist()})
     projection = read_json(projection_path)
-    for directory, record in previews.items():
+    for directory, record in tqdm(previews.items(), desc="JPG 預覽", unit="video", dynamic_ncols=True):
         destination = root / directory / "preview.jpg"
         if not destination.exists():
             save_preview(record["image_path"], load_feature(root, record), projection, destination, args.jpeg_quality)

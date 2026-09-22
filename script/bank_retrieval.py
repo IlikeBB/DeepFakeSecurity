@@ -69,10 +69,12 @@ def build(plan, args, bank, output):
 
 def load_index(plan, bank, output):
     info = read_json(output / "stage1/retrieval.json")
+    if "alignment" in info:
+        raise ValueError("此索引使用已移除的文字對齊分支；請另取 experiment 名稱，重新建立原始 DINO bank")
     if (info["plan_sha256"] != sha256(bank / "splits.json")
             or info["source_config_sha256"] != sha256(bank / "bank_config.json")):
         raise ValueError("Retrieval index does not match source configuration/split")
-    for item in info["files"].values():
+    for item in tqdm(info["files"].values(), desc="驗證 bank 檔案", unit="file", dynamic_ncols=True):
         if sha256(item["path"]) != item["sha256"]:
             raise ValueError(f"Retrieval index changed: {item['path']}")
     rows = read_json(info["files"]["sources"]["path"])
@@ -89,6 +91,7 @@ def match_image(features, image_path, search, info, sources, arrays, match_count
     scores, distances, neighbors = search.score(selected[None], info["top_fraction"])
     distances, neighbors = distances[0], neighbors[0]
     count = max(1, math.ceil(len(ids) * info["top_fraction"]))
+    details = getattr(search, "details", None)
     scoring = np.argsort(-distances, kind="stable")[:count]
     matches = []
     # These are the patches contributing most to the image's anomaly score.
@@ -100,18 +103,29 @@ def match_image(features, image_path, search, info, sources, arrays, match_count
                         "bank_patch_id": nearest, "source_image": source["image_path"],
                         "source_video": source["video_id"], "source_family": source["group_id"],
                         "source_patch": [source_patch // source["grid"][1], source_patch % source["grid"][1]],
-                        "cosine_similarity": float(1 - distances[position]),
-                        "distance": float(distances[position])})
+                        "cosine_similarity": float(1 - (details["nearest_distances"][position] if details else distances[position])),
+                        "distance": float(details["nearest_distances"][position] if details else distances[position]),
+                        "anomaly_distance": float(distances[position])})
+        if details:
+            matches[-1]["reference_patch_ids"] = details["candidate_ids"][position].tolist()
+            matches[-1]["reference_weights"] = details["weights"][position].tolist()
     distance_map = np.full(grid, -1., dtype=np.float32)
     neighbor_map = np.full(grid, -1, dtype=np.int64)
     distance_map.reshape(-1)[ids] = distances
     neighbor_map.reshape(-1)[ids] = neighbors
+    if details:
+        details["query_patch_ids"] = ids
     return {"score": float(scores[0]), "foreground_patches": len(ids), "scoring_patches": count,
-            "matches": matches}, distance_map, neighbor_map
+            "matches": matches, **({"comparison_scores": details["scores"]} if details else {})}, distance_map, neighbor_map
 
 
 def evaluate(plan, args, bank, cache, output):
     info, sources, arrays = load_index(plan, bank, output)
+    method = getattr(args, "method", "nearest")
+    attention = None
+    if method == "cross_attention":
+        from script.bank_attention import attention_info
+        attention = attention_info(output)
     stage2 = output / "stage2"
     stage2.mkdir(parents=True, exist_ok=True)
     bank_families = {row["group_id"] for row in sources}
@@ -125,17 +139,23 @@ def evaluate(plan, args, bank, cache, output):
     devices = args.devices or ["cpu"]
     shards = [rows[i::len(devices)] for i in range(len(devices))]
 
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+    with ThreadPoolExecutor(max_workers=args.workers) as pool, tqdm(
+            total=len(rows), desc="Stage 2 檢索", unit="image", dynamic_ncols=True, mininterval=.5) as progress:
         def worker(shard, device):
             if not shard:
                 return []
-            search = PatchBank(arrays["features"], device, args.query_chunk_size, args.bank_chunk_size)
+            if method == "nearest":
+                search = PatchBank(arrays["features"], device, args.query_chunk_size, args.bank_chunk_size)
+            else:
+                from script.bank_attention import ReferenceBank, load_attention
+                model = load_attention(attention, device) if attention else None
+                search = ReferenceBank(arrays["features"], device, args.query_chunk_size, args.bank_chunk_size,
+                                       args.attention, model=model)
             result = []
             def read(row):
                 return load_sample(cache / row["role"], row)[1]
             # Bound prefetched features rather than retaining the entire test set.
-            for start in tqdm(range(0, len(shard), 32), desc=f"Stage 2 檢索 {device} ({len(shard)} images)",
-                              unit="batch", dynamic_ncols=True):
+            for start in range(0, len(shard), 32):
                 batch = shard[start:start + 32]
                 for row, features in zip(batch, pool.map(read, batch)):
                     prediction, distances, neighbors = match_image(features, row["image_path"], search,
@@ -144,9 +164,13 @@ def evaluate(plan, args, bank, cache, output):
                     folder.mkdir(parents=True, exist_ok=True)
                     path = folder / f"{row['sample_id']:08d}.npz"
                     temporary = path.with_suffix(".tmp.npz")
-                    np.savez(temporary, distances=distances, neighbors=neighbors)
+                    details = getattr(search, "details", {})
+                    np.savez(temporary, distances=distances, neighbors=neighbors,
+                             **{key: value for key, value in details.items() if key != "scores"})
                     temporary.replace(path)
                     result.append(dict(row, **prediction, patch_matches=str(path.resolve())))
+                with progress.get_lock():
+                    progress.update(len(batch))
             return result
 
         results = [row for shard in map_devices(worker, shards, devices) for row in shard]
@@ -159,8 +183,20 @@ def evaluate(plan, args, bank, cache, output):
     write_json(stage2 / "evaluation_scores.json", tested)
     write_json(stage2 / "thresholds.json", {"threshold": threshold, "quantile": args.threshold_quantile,
                "calibration_count": len(calibrated), "retrieval_sha256": sha256(output / "stage1/retrieval.json")})
-    report = {"protocol": plan["protocol"], "method": info["method"],
+    comparison = {}
+    if method != "nearest":
+        for name in tested[0]["comparison_scores"]:
+            cutoff = float(np.quantile([r["comparison_scores"][name] for r in calibrated], args.threshold_quantile))
+            comparison[name] = metrics([dict(r, score=r["comparison_scores"][name]) for r in tested], cutoff)
+        write_json(stage2 / "comparison.json", dict(
+            protocol="Development comparison on the existing evaluation split; not an untouched final test",
+            methods=comparison, retrieval_sha256=sha256(output / "stage1/retrieval.json"),
+            attention_sha256=sha256(output / "stage1/attention.json") if attention else None))
+    report = {"protocol": plan["protocol"], "method": info["method"] if method == "nearest" else method,
               "bank_images": info["image_count"], "bank_patches": info["patch_count"],
-              "image": metrics(tested, threshold)}
+              "image": metrics(tested, threshold), **({"comparison": comparison} if comparison else {})}
     write_json(stage2 / "metrics.json", report)
-    print(report, flush=True)
+    result = report["image"]
+    print(f"Stage 2 完成：AUROC={result['auroc']:.4f} AP={result['average_precision']:.4f} "
+          f"FPR={result['false_positive_rate']:.4f} TPR={result['true_positive_rate']:.4f}\n"
+          f"完整結果：{stage2 / 'metrics.json'}", flush=True)

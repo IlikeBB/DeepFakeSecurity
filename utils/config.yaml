@@ -88,7 +88,22 @@ bank_probe:
 # 當前實驗：bash run.sh stage1/stage2 --exper FB_01
 # 直接查詢 real patch bank；無分類器訓練，train_fake 保留切分但不使用。
 retrieval:
-  experiment: null  # 名稱由 --exper 指定
+  experiment: ATT_DEMO  # 使用者指定；Stage 1／Stage 2 共用
+  method: cross_attention  # nearest／topk／cross_attention；後者同時輸出三種方法比較
+  attention:
+    neighbors: 16  # 先檢索 Top-K real patches，再做注意力加權
+    temperature: 0.07  # 不需訓練的 Top-K cosine softmax 基準
+    hidden: 128
+    heads: 4
+    epochs: 30  # 最大訓練輪數；只訓練 Q/K 投影
+    patience: 5  # real validation loss 連續 5 輪未改善即停止
+    batch_size: 256  # 多 GPU 合計的 patch batch
+    patches_per_image: 32
+    validation_fraction: 0.2  # bank real 內按來源家族切分
+    learning_rate: 0.001
+    weight_decay: 0.0001
+    noise_std: 0.02  # 訓練 query 擾動，目標保留乾淨 DINO 特徵
+  export_previews: false  # 選用 PCA／JPG 預覽；關閉可省去視覺化與重讀 NPY 的時間
   bank_dir: /ssd8/chihyu/Project/DeepFakeSecurity/RAG/normal
   results_dir: /ssd8/chihyu/Project/DeepFakeSecurity/outputs/feature_bank
   seed: 42  # 沿用前次全量實驗的來源家族切分
@@ -133,7 +148,7 @@ segment_face:
   batch_size: 4
   cpu_threads: 4  # run.sh 單任務設定；mission.sh 會依分配核心數覆寫
   labels: all  # real→normal，fake→anomaly；也可單獨選 real / fake
-  parts: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]  # null 表示全部資料分包
+  parts: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]  # null 表示全部資料分包
   frames_per_video: 10  # 均勻抽樣，不足則全部使用；null 表示全部有效幀
   overwrite: false  # 已有 JPG 直接略過；調整裁切參數後可加 --overwrite 重做
   limit: null  # 每個類別的來源影片數量上限，分派程序前套用；null 表示全部
