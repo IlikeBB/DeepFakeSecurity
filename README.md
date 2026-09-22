@@ -1,5 +1,124 @@
 # DeepFakeSecurity
 
+## 目前啟動方式：FB_01 real feature bank 相似度檢索
+
+```bash
+cd /ssd8/chihyu/Project/DeepFakeSecurity
+# Stage 1：多 GPU 提取 real patch，建立檢索索引與每支影片的 JPG 預覽
+bash run.sh stage1 --exper FB_01 --workers 16 --gpus 4 5 6
+# Stage 1 完成後，使用相同實驗名稱執行 Stage 2
+bash run.sh stage2 --exper FB_01 --workers 16 --gpus 4 5 6
+```
+
+入口會自動啟用 `pt230`，再執行 `main.py --task bank-retrieval`。
+參數集中在 `utils/config.yaml` 的 `retrieval`；圖片、標籤、模型路徑沿用現有 YAML 設定。
+尚未提取特徵也能直接開始。`--batch-size` 是每張 GPU 的提取 batch，預設 8。
+每張 GPU 各有模型／搜尋 worker；`--workers` 是所有 GPU 共用的圖片與 NPY 讀取執行緒上限。
+CPU 模式加空的 `--gpus`。只檢查資料切分可先執行 `bash run.sh stage1 --exper FB_01 --stage prepare`。
+
+流程固定 DINOv3，不訓練分類器：每個前景 patch 查詢 real bank 的 cosine 最近鄰，
+以 `1 - similarity` 作距離，最高 10% 距離平均為圖片異常分數。
+閾值只用獨立的 real calibration 資料校準；fake 僅在保留的 evaluation 中評估。
+使用原全量家族切分；`train_fake` 仍記錄在 split 中供比較，但本方法不提取、不使用該組。
+前景判定為非黑色像素占比，不是新增語意分割；目前搜尋整個 real bank，未限制匹配到相同臉部區域。
+分數較高代表偏離 real bank，不是 fake 機率。新方法的 AUC 必須以實際 Stage 2 評估為準。
+
+```text
+RAG/normal/FB_01/
+  <來源分包>/<影片>/           # real NPY 與 preview.jpg
+  retrieval/                  # real 特徵矩陣、來源編號、patch 編號
+  cache/calibration/          # 校準查詢特徵，不放入檢索索引
+  cache/evaluation/           # 測試查詢特徵，不放入檢索索引
+outputs/feature_bank/FB_01/
+  stage1/                     # config.json、splits.json、sources.json、retrieval.json
+  stage2/                     # metrics.json、thresholds.json、圖片分數與完整 patch 匹配 NPZ
+```
+
+`stage2/evaluation_scores.json` 包含每張圖片的分數、判斷與最多 5 個高異常 patch 的最近鄰證據：
+來源 JPG、來源影片／家族、雙方 patch 座標與 cosine similarity。
+完整距離及 bank patch ID 在每張圖片的 NPZ；背景位置使用 `-1`，由 Stage 1 索引還原匹配來源。
+Stage 1 可重跑以續接已完成 NPY；完成索引後會驗證雜湊並沿用。
+兩階段須用同一 `--exper`；修改資料、模型或比對參數時另取名稱，GPU／執行緒／batch 可調整。
+
+以下為舊版實驗紀錄；目前有效入口以上方檢索流程為準。舊線性評分器的 0.6739 不代表此檢索方法的成績。
+
+## AUC 改善實驗：自動建立／沿用 DINO 特徵
+
+```bash
+cd /ssd8/chihyu/Project/DeepFakeSecurity
+# 將「你取的名稱」換成自己的名稱，兩階段必須一致。
+bash run.sh probe-stage1 --exper "你取的名稱" --workers 8 --gpus 1 2
+bash run.sh stage2 --exper "你取的名稱" --workers 8 --gpus 1 2
+```
+
+輸出位置為 `outputs/feature_bank/<你取的名稱>/`。不會自動取名；未指定時會提示用法並停止。
+`stage2` 執行 probe 驗證；原本的 `probe-stage2` 仍可使用。舊版 adapter 驗證入口改為 `adapter-stage2`。
+例如 Stage 1 使用 `--exper demo_S1`，Stage 2 也使用 `--exper demo_S1`，不能改成 `demo_S2`。
+`--exper` 指定整個實驗的名稱，不是階段名稱；找不到權重時，錯誤訊息會列出檢查路徑與可用實驗。
+也可以自行設定 `utils/config.yaml` 的 `bank_probe.experiment`，命令列參數優先。
+`source_experiment` 預設為 `null`：從人臉 JPG 自動建立與 `--exper` 同名的來源特徵，
+不再依賴 `dfdc_patch_full_v1`。也可用 `--source-experiment "已有來源名稱"` 沿用其他實驗的快取。
+
+設定集中在 `utils/config.yaml` 的 `bank_probe`。預設用 8 個執行緒讀取 NPY/JPG，
+使用 GPU 1、2；`--workers`、`--gpus` 可覆寫。DINO 提取時每張卡載入一份模型，
+共用最多 `--workers` 個圖片讀取執行緒；`--extract-batch-size` 是每張卡的 batch（預設 8）。
+評分器訓練時，每張卡有一個候選模型工作執行緒，
+不同候選分卡訓練，最終選定模型只在第一張卡重擬合；Stage 2 將圖片分配到多張卡評分。
+GPU 版使用與 CPU 版相同的加權 logistic loss 與 L2 正則化，由 GPU 計算 loss／gradient，
+CPU 的 L-BFGS-B 控制最佳化；小型評分器不保證比 CPU 快，實際速度也受磁碟讀取影響。
+空的 `--gpus` 可改用 CPU。資源設定適用於 probe 的建庫、訓練與評分。
+Stage 1 先固定全量來源家族切分（沿用 `feature_bank.seed`），只提取 bank／train_fake，
+然後訓練評分器；Stage 2 才提取 calibration／evaluation 並驗證。
+新來源的 real bank 與每支影片的預覽在 `RAG/normal/<名稱>/`；
+fake／校準／測試 NPY 分開存於 `RAG/cache/<名稱>/<分組>/`，不混入 normal bank。
+評分器與指標存放 `outputs/feature_bank/<名稱>/`。不需要先跑舊 adapter 訓練。
+中斷後用相同指令重跑會檢查並沿用完成的 NPY，缺少的檔案才重新提取。
+明確指定的 `--source-experiment` 若不存在則報錯；舊版來源沿用原有快取路徑，需已完成所需分組的提取。
+兩階段都會顯示圖片進度，Stage 1 另列出每個候選的 validation AUROC。
+
+新評分器先依黑色背景的像素比例降低背景 patch 權重，再計算單張圖片的特徵平均、
+標準差與 2×2 區域平均。這個 2×2 是空間池化，不是影片時序；原始 `14×14×768` NPY 保持不變。
+亮度只用來估計已分割圖片的前景占比，並非重新執行語意分割。
+標準化統計只用 real。從原 training 的來源家族另留 20% 作內部驗證，
+比較兩種描述子、real 統計距離與三個固定正則化強度的線性評分器；
+同來源 real／fake 一起分派，原 calibration／evaluation 完全不參與選型。
+選定後以原 training 重擬合；real bank 不加入 fake。
+
+預設評分器使用 1,997 張 real，加上 40 支不同來源影片的 400 張 fake；
+每支 fake 的擬合權重是 real 的 10%。這是少量 fake 輔助的弱監督評分，
+不是純 real-only，也不是舊 adapter 的「每五步插入 fake」訓練方式。
+內部驗證會使用其保留的 real／fake 標籤；400 張僅指最後擬合使用的 fake 數量。
+可用 `--fake-videos 0 --exper probe_real_only_v1` 關閉 fake 擬合，
+但內部驗證仍使用 fake 標籤選擇統計方式。
+改動參數時請更換實驗名稱，兩階段帶上相同參數；已完成的 Stage 1 重跑會沿用評分器。
+
+2026-09-23 實測，同一組 6,549 張圖片（440 real／6,109 fake）：
+
+| 方法 | Image AUROC | AP | FPR | TPR |
+| --- | --- | --- | --- | --- |
+| 原 adapter＋最近鄰 bank | 0.5971 | 0.9519 | 0.0705 | 0.1216 |
+| 前景／空間統計＋少量 fake 評分器 | **0.6739** | 0.9640 | 0.0250 | 0.1015 |
+
+最佳內部驗證 AUROC 為 0.7617，選定 4,608 維描述子與 `C=0.01`。
+FPR／TPR 使用各方法在 real calibration 上的第 99 百分位閾值，並非相同測試 FPR；
+AUROC 提升不代表目前門檻的召回率已足夠。fake 約占測試圖片 93.3%，因此 AP 很高不能單獨視為良好辨識能力。
+此結果仍非 identity-disjoint 或官方 DFDC test；不代表新身份、新資料集上的效能。
+
+上述數字來自先前 CPU 版的實測（當時輸出名稱為 `dfdc_bank_probe_v1`），並非多 GPU 版重新量測的結果。
+新實驗使用你指定的名稱，輸出在 `outputs/feature_bank/<你取的名稱>/`。
+輸出中的 `selection.json` 記錄候選、選型及 fake 名單，
+`validation_split.json` 記錄內部家族切分，`scorer.npz` 存標準化統計與線性權重，
+`metrics.json`／`evaluation_scores.json` 存測試結果。原實驗指標完整保留。
+評分輸出是排序分數，不是經機率校準的 fake 機率；此評分器目前提供圖片分數，沒有 patch 定位熱圖。
+
+設計參考正常特徵統計建模的 [PaDiM](https://arxiv.org/abs/2011.08785)，
+以及使用異常標籤改善特徵比對的 [DFM（CVPR 2025）](https://openaccess.thecvf.com/content/CVPR2025/html/Wu_DFM_Differentiable_Feature_Matching_for_Anomaly_Detection_CVPR_2025_paper.html)。
+這裡實作的是容易驗證的統計描述子／線性評分基準，並非上述論文的完整復現。
+
+feature bank 統一放在 `RAG/normal/`，既有 `dfdc_patch_full_v1` 已由 `RAG/general/` 搬入。
+既有 provenance 設定檔可能保留建立時的舊路徑；程式允許搬移 bank 根目錄，
+保留原設定檔與雜湊，避免使既有 adapter／校準結果失效。
+
 ## 全量實驗：Stage 1 建庫、Stage 2 驗證
 
 ```bash
@@ -12,8 +131,25 @@ bash run.sh stage1 --stage prepare
 bash run.sh stage1 --device cuda:1
 
 # Stage 1 完成後才執行 Stage 2：提取保留資料、校準門檻、評估與輸出熱圖
-bash run.sh stage2 --device cuda:1
+bash run.sh adapter-stage2 --device cuda:1
 ```
+
+Stage 1／Stage 2 都會顯示 `tqdm` 進度條，包含完成數、處理速度與預估剩餘時間：
+特徵提取以 batch 計數（同時顯示圖片總數），bank 載入與異常評分以圖片計數，
+預覽／熱圖以影片計數。訓練顯示目前 epoch、step、`train_mean_auc`、平均 real loss 與累計 fake 加入次數。
+`train_mean_auc` 是本 epoch 中同時有 real／fake 的批次 AUROC 之算術平均，每次 fake 加入時更新；
+epoch 開始時歸零，尚無有效批次或純 real 訓練時顯示 `N/A`，JSON 記為 `null`。
+分數取自該步權重更新前的訓練樣本；沒有使用校準／測試資料。
+這只是訓練監測值，不等於整個 epoch 合併計算的 AUC，也不能取代 Stage 2 完整測試集的 AUROC。
+每個 epoch 的 `mean_batch_auc` 與 `auc_batches` 會保存在 `training/adapter.json` 的 `history`。
+資料檢查、模型載入與 PCA 擬合也有階段提示；模型載入及 PCA 計算本身沒有細分百分比。
+重跑時進度包含已有特徵的快取檢查；若 adapter 已完成，會顯示沿用權重並略過訓練。
+新進度顯示適用於重新啟動的程序，已在執行中的 Python 程序不會自動載入程式修改。
+
+DINOv3 使用 PyTorch。`main.py` 在載入 Transformers 前設定 `USE_TF=0`、`USE_TORCH=1`，
+避免其影像處理器自動匯入 TensorFlow 而出現 oneDNN／CPU 指令集提示；
+`run.sh` 與 `mission.sh patch-bank` 都會套用。這些提示本身不是錯誤，無須重裝 CUDA 或 TensorFlow。
+RetinaFace 的 `mission.sh crop-face` 仍在獨立程序使用原本的 TensorFlow 環境。
 
 這兩個入口固定使用 `--full-data` 與新實驗名稱 `dfdc_patch_full_v1`。
 「全量」是全部現有 segmentation JPG 納入資料池，包含所有現有幀，
@@ -45,9 +181,9 @@ Stage 2 會檢查完成紀錄與權重，使用凍結後的 bank 與 adapter，�
 兩階段要使用相同實驗名稱及資料／訓練參數；如果 Stage 1 覆寫參數，Stage 2 也要帶上相同值。
 預設模型、epoch、fake 間隔與權重沿用 YAML 的 `patch_bank`，比例目前固定於 `bank_flat.py`。
 
-bank 位於 `RAG/general/dfdc_patch_full_v1/`；驗證指標位於
+bank 位於 `RAG/normal/dfdc_patch_full_v1/`；驗證指標位於
 `outputs/feature_bank/dfdc_patch_full_v1/metrics.json`，圖片分數在 `evaluation_scores.json`。
-這仍是 DFDC test 清單內重新切分的實驗，不是官方 test 評分；此處只核對切分，尚未執行全量訓練。
+這仍是 DFDC test 清單內重新切分的實驗，不是官方 test 評分；全量結果與改善比較見上方紀錄。
 
 ## 局部 feature bank 與 real 為主的訓練
 
@@ -72,7 +208,7 @@ bash run.sh real-only
 bash run.sh baseline
 
 # 調整 fake 加入間隔、權重；變更實驗設定需另取名稱
-bash run.sh adapter --fake-interval 10 --fake-weight 0.05 --experiment dfdc_patch_sparse_fake_v1
+bash run.sh adapter --fake-interval 10 --fake-weight 0.05 --exper dfdc_patch_sparse_fake_v1
 ```
 
 `run.sh` 內已用中文註解列出三種實驗流程，每次執行一個實驗；`bash run.sh --help`
@@ -113,7 +249,7 @@ GPU 與訓練參數仍由 YAML 管理，命令列覆寫優先；原本 `--task .
 熱圖僅呈現 patch 異常距離，不是經像素標註驗證的偽造區域。
 
 ```text
-RAG/general/dfdc_patch_adapter_v1/
+RAG/normal/dfdc_patch_adapter_v1/
   bank_config.json、splits.json、manifest.jsonl、patch_index.json
   visualization.json                       # 僅 real bank 擬合的 PCA 色彩設定
   dfdc_train_part_N/<video>/
@@ -137,7 +273,7 @@ outputs/feature_bank/dfdc_patch_adapter_v1/
 
 可拆開執行 `--stage prepare`、`extract`、`train`、`evaluate`；預設 `all` 依序完成。
 相同設定重跑會沿用已完成特徵與 adapter checkpoint，再重新評估；不會額外追加 epoch。
-若中途訓練尚未完成，重跑會由固定 seed 重新訓練。改變設定請使用新的 `--experiment`。
+若中途訓練尚未完成，重跑會由固定 seed 重新訓練。改變設定請使用新的 `--exper`。
 單張推論需要先完成校準，輸入須採用相同的人臉裁切／segmentation 流程：
 
 ```bash
@@ -327,7 +463,7 @@ Matplotlib 圖保留裁切後的人臉比例，座標軸標示寬、高像素；
 預覽使用的那張人臉也會保留 NPY；JPG 僅供查看，完整數值位於 NPY。
 
 ```text
-RAG/general/dfdc_real_bank_v2/
+RAG/normal/dfdc_real_bank_v2/
   bank_config.json
   splits.json
   visualization.json
@@ -353,7 +489,7 @@ RAG/general/dfdc_real_bank_v2/
 bash run.sh --task feature-bank --device cuda:1
 
 # 少量測試：2 個 real 來源資料夾，各 2 張人臉
-bash run.sh --task feature-bank --experiment bank_trial --bank-videos 2 --max-frames 2 --device cuda:1
+bash run.sh --task feature-bank --exper bank_trial --bank-videos 2 --max-frames 2 --device cuda:1
 
 # 核心測試
 conda run -n pt230 python -m unittest discover -s tests -v
@@ -361,7 +497,7 @@ conda run -n pt230 python -m unittest discover -s tests -v
 
 同設定重跑會驗證並沿用已有 NPY；缺少的預覽可直接從 NPY 重建。
 每張來源與 NPY 路徑記錄於 `manifest.jsonl`，JSON 保存圖片大小、修改時間及陣列形狀。
-更換資料、模型或抽樣設定時使用新的 `--experiment` 名稱；裝置與 batch size 可直接調整。
+更換資料、模型或抽樣設定時使用新的 `--exper` 名稱；裝置與 batch size 可直接調整。
 目前 `build` 的目錄格式用於建庫，不直接接入舊版 `evaluate/predict` 的索引格式。
 
 程式分工：`script/feature_bank.py` 管理流程；`script/bank_data.py` 負責來源與標籤；

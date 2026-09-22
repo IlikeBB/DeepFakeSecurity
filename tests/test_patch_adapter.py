@@ -7,13 +7,19 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from script.bank_adapter import (adapt_features, fake_ranking_loss, load_adapter,
+from script.bank_adapter import (adapt_features, batch_auc, fake_ranking_loss, load_adapter,
                                  matching_scores, train_adapter)
 from script.bank_data import read_json, write_json
 from script.bank_flat import prepare_flat_plan, select_full_groups
 
 
 class PatchAdapterTests(unittest.TestCase):
+    def test_batch_auc_direction_and_ties(self):
+        self.assertEqual(batch_auc(torch.tensor([.1, .2]), torch.tensor([.7, .8])), 1.)
+        self.assertEqual(batch_auc(torch.tensor([.7, .8]), torch.tensor([.1, .2])), 0.)
+        self.assertEqual(batch_auc(torch.tensor([.5, .5]), torch.tensor([.5])), .5)
+        self.assertEqual(batch_auc(torch.tensor([.1, .7]), torch.tensor([.2, .7])), .625)
+
     def test_stage_boundary_and_completion_guard(self):
         from script.feature_bank import main
         with tempfile.TemporaryDirectory() as tmp:
@@ -38,6 +44,11 @@ class PatchAdapterTests(unittest.TestCase):
                 self.assertEqual(extract.call_args.kwargs["roles"], {"bank", "train_fake"})
                 train.assert_called_once()
                 evaluate.assert_not_called()
+                # Relocating general -> normal keeps bank/checkpoint fingerprints valid.
+                old_bank = Path(args.output_dir)
+                new_bank = Path(tmp) / "normal"
+                old_bank.rename(new_bank)
+                args.output_dir = str(new_bank)
                 args.stage = "stage2"
                 main(profile="patch_bank")
                 self.assertEqual(extract.call_args.kwargs["roles"], {"calibration", "evaluation"})
@@ -143,6 +154,9 @@ class PatchAdapterTests(unittest.TestCase):
             self.assertEqual(info["steps"], 6)
             self.assertEqual(info["fake_updates"], 3)
             self.assertEqual(info["fake_images"], 2)
+            for epoch in info["history"]:
+                self.assertEqual(epoch["auc_batches"], 1)
+                self.assertTrue(0 <= epoch["mean_batch_auc"] <= 1)
             adapter = load_adapter(args, root, root / "results")
             actual = adapt_features(features[:2], adapter)
             original = features[:2] / np.linalg.norm(features[:2], axis=-1, keepdims=True)
@@ -157,6 +171,9 @@ class PatchAdapterTests(unittest.TestCase):
                 train_adapter(pure, args, root, root / "pure")
             self.assertEqual(set(accessed), {"bank"})
             self.assertEqual(read_json(root / "pure/training/adapter.json")["fake_updates"], 0)
+            for epoch in read_json(root / "pure/training/adapter.json")["history"]:
+                self.assertEqual(epoch["auc_batches"], 0)
+                self.assertIsNone(epoch["mean_batch_auc"])
             write_json(root / "splits.json", {"changed": True})
             with self.assertRaisesRegex(ValueError, "does not match"):
                 load_adapter(args, root, root / "results")

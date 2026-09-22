@@ -6,6 +6,7 @@ import re
 import random
 
 import numpy as np
+from tqdm.auto import tqdm
 
 from script.bank_data import read_json, select_groups
 
@@ -53,7 +54,7 @@ def prepare_flat_plan(config):
         directory = Path(config[key])
         if not directory.is_dir():
             raise FileNotFoundError(directory)
-        for image in sorted(directory.glob("*.jpg")):
+        for image in tqdm(sorted(directory.glob("*.jpg")), desc=f"檢查 {key}", unit="image", dynamic_ncols=True):
             match = pattern.fullmatch(image.name)
             if not match:
                 raise ValueError(f"Expected part-video-frame filename: {image}")

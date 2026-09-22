@@ -1,4 +1,5 @@
 import argparse
+import os
 from pathlib import Path
 
 import yaml
@@ -20,6 +21,8 @@ def parse_args(argv=None):
     config.pop("segment_face", None)
     config.pop("mission", None)
     config.pop("patch_bank", None)
+    config.pop("bank_probe", None)
+    config.pop("retrieval", None)
     parser = argparse.ArgumentParser(description="Extract DINOv3 features from Celeb-DF videos.")
     parser.add_argument("--data-root", type=Path)
     parser.add_argument("--model-path", type=Path)
@@ -57,10 +60,22 @@ def parse_args(argv=None):
 
 
 if __name__ == "__main__":
+    # 本入口使用 PyTorch；在匯入 Transformers 前停用其 TensorFlow 自動載入。
+    # RetinaFace 由 mission.sh 另開程序執行，不受此設定影響。
+    os.environ["USE_TF"] = "0"
+    os.environ["USE_TORCH"] = "1"
     selector = argparse.ArgumentParser(add_help=False)
-    selector.add_argument("--task", choices=("feature-bank", "patch-bank", "segment-face", "extract"), default="feature-bank")
+    selector.add_argument("--task", choices=("bank-retrieval", "feature-bank", "patch-bank", "bank-probe", "segment-face", "extract"), default="bank-retrieval")
     task, remaining = selector.parse_known_args()
-    if task.task == "segment-face":
+    if task.task == "bank-retrieval":
+        from script.retrieval import main
+
+        main(remaining)
+    elif task.task == "bank-probe":
+        from script.bank_probe import main
+
+        main(remaining)
+    elif task.task == "segment-face":
         from script.segment_face import main
 
         main(remaining)

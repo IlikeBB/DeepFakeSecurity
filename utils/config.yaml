@@ -13,7 +13,7 @@ overwrite: false
 
 # bash run.sh：逐張提取 real 人臉，儲存 NPY，每個來源資料夾附一張 JPG 預覽。
 feature_bank:
-  output_dir: RAG/general
+  output_dir: RAG/normal
   stage: build  # 只建 real bank；不執行校準、評估或影片聚合
   storage_format: npy
   experiment: dfdc_real_bank_v2
@@ -65,6 +65,46 @@ patch_bank:
   fake_batch_size: 2
   fake_weight: 0.1
   fake_margin: 0.1  # 希望 fake 的圖片分數高於本批 real 分數的幅度
+
+# AUC 改善實驗：自動建立／沿用原始 DINO NPY，不沿用看過全部 training 的 adapter。
+# real 統計建模＋少量 fake 輔助線性評分；這是弱監督，不是純 real-only。
+bank_probe:
+  source_experiment: null  # null：從 JPG 建立與 --exper 同名的來源；有快取可指定舊名稱
+  experiment: null  # 請自行填入名稱，或啟動時使用 --exper 指定；不自動命名
+  bank_dir: /ssd8/chihyu/Project/DeepFakeSecurity/RAG/normal
+  cache_dir: RAG/cache  # fake／校準／測試 NPY 分開存，不混入 normal bank
+  results_dir: outputs/feature_bank
+  seed: 73
+  validation_fraction: 0.2  # 僅從原 training 抽 source-family-disjoint 驗證組
+  fake_videos: 40  # 每個來源 family 至多選一支；0 只比較 real 統計距離
+  fake_weight: 0.1  # fake 每支影片對評分器的權重為 real 的 10%
+  regularization: [0.001, 0.01, 0.1]  # 固定候選，僅以內部驗證 AUROC 選型
+  threshold_quantile: 0.99  # 閾值只用原 calibration real 決定
+  cpu_threads: 4  # CPU 數值運算的執行緒上限
+  workers: 8  # 平行讀取 NPY/JPG；保持原始樣本順序
+  extract_batch_size: 8  # 每張 GPU 的 DINO 提取 batch；記憶體不足時調小
+  gpu_ids: [1, 2]  # 每張 GPU 一個候選模型工作執行緒；[] 使用 CPU
+
+# 當前實驗：bash run.sh stage1/stage2 --exper FB_01
+# 直接查詢 real patch bank；無分類器訓練，train_fake 保留切分但不使用。
+retrieval:
+  experiment: null  # 名稱由 --exper 指定
+  bank_dir: /ssd8/chihyu/Project/DeepFakeSecurity/RAG/normal
+  results_dir: /ssd8/chihyu/Project/DeepFakeSecurity/outputs/feature_bank
+  seed: 42  # 沿用前次全量實驗的來源家族切分
+  gpu_ids: [4, 5, 6]
+  workers: 16
+  cpu_threads: 4
+  batch_size: 8  # 每張 GPU 的 DINO 提取 batch
+  dtype: float16
+  foreground_minimum: 0.5  # patch 至少一半非黑色像素，才納入建庫與查詢
+  top_fraction: 0.1  # 最大 10% 最近鄰距離平均為圖片分數
+  threshold_quantile: 0.99  # 僅使用 calibration real 決定異常門檻
+  query_chunk_size: 1024
+  bank_chunk_size: 16384
+  match_count: 5  # JSON 顯示最多 5 個高異常 patch 的匹配；完整匹配存 NPZ
+  pca_images: 32
+  jpeg_quality: 95
 
 # mission.sh 的總資源預算；GPU 模式每張卡一個程序，影片平均分配。
 mission:

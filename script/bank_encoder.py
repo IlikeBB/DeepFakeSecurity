@@ -3,9 +3,11 @@
 import numpy as np
 from PIL import Image
 import torch
+from tqdm.auto import tqdm
 
 
 def load_encoder(args):
+    tqdm.write(f"[DINOv3] 載入模型至 {args.device}")
     from transformers import AutoImageProcessor, AutoModel
 
     processor = AutoImageProcessor.from_pretrained(args.model_path, local_files_only=True)
@@ -15,13 +17,14 @@ def load_encoder(args):
 
 
 @torch.inference_mode()
-def encode(paths, model, processor, args):
+def encode(paths, model, processor, args, image_pool=None):
     cls, patches = [], []
     for start in range(0, len(paths), args.batch_size):
-        images = []
-        for path in paths[start:start + args.batch_size]:
+        def read_image(path):
             with Image.open(path) as image:
-                images.append(image.convert("RGB"))
+                return image.convert("RGB")
+        batch = paths[start:start + args.batch_size]
+        images = list(image_pool.map(read_image, batch)) if image_pool else [read_image(path) for path in batch]
         inputs = processor(images=images, return_tensors="pt").to(args.device)
         hidden = model(**inputs).last_hidden_state
         cls.append(hidden[:, 0].float().cpu().numpy())
