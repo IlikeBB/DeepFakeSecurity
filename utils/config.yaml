@@ -1,0 +1,87 @@
+# 專案環境與表徵提取參數；命令列參數優先於此檔案。
+# 相對路徑以專案根目錄為基準，絕對路徑則直接使用。
+data_root: /ssd2/DeepFakes/celeb-df-video
+model_path: models/dinov3-vitb16-pretrain-lvd1689m
+output_dir: outputs/features
+
+device: cpu  # GPU 範例：cuda:0
+num_frames: 32
+batch_size: 8
+split: all  # all / train / test
+limit: null  # null 表示不限制影片數量；測試時可設為 1
+overwrite: false
+
+# bash run.sh：逐張提取 real 人臉，儲存 NPY，每個來源資料夾附一張 JPG 預覽。
+feature_bank:
+  output_dir: RAG/general
+  stage: build  # 只建 real bank；不執行校準、評估或影片聚合
+  storage_format: npy
+  experiment: dfdc_real_bank_v2
+  pca_images: 32  # 用 bank real 圖片建立共用 PCA 轉色規則
+  visualization_size: 224  # 僅舊 visualize 模式使用；build 預覽依裁切人臉比例繪製
+  jpeg_quality: 95
+  results_dir: outputs/feature_bank
+  faces_dir: /ssd8/chihyu/Dataset/DeepFake_Dataset/DFDC-Frame
+  source_root: /ssd2/DeepFakes/deepFakeChallenge
+  label_csv: /ssd2/DeepFakes/DFDC_list/test.csv
+  device: auto  # auto 使用 cuda:0（若可用），可由 --device cuda:6 覆寫
+  seed: 42
+  bank_videos: 50  # 最多讀取的 real 來源資料夾數；每張人臉獨立提取
+  # 以下三個分組數僅舊 all/evaluate 流程使用；build 不建立校準或評估分組。
+  calibration_videos: 20
+  eval_real_videos: 20
+  eval_fake_videos: 20
+  max_frames: 32
+  batch_size: 8
+  dtype: float16  # 存檔精度；提取與距離計算用 float32
+  top_fraction: 0.1  # 圖片分數：最高 10% patch 距離的平均
+  threshold_quantile: 0.99  # 僅使用 calibration real 校準
+  query_chunk_size: 1024
+  bank_chunk_size: 16384
+
+# mission.sh 的總資源預算；GPU 模式每張卡一個程序，影片平均分配。
+mission:
+  cpu_cores: 8  # 總邏輯 CPU 核心數，以 CPU affinity 限制，再平均分配給程序
+  gpu_ids: [1, 2]  # 清單長度就是 GPU 數量；[] 表示只用 CPU
+  cpu_workers: 4  # 只用 CPU 時的程序數，上限為 cpu_cores 與影片數
+
+# bash mission.sh segment-face：擴張分割遮罩後裁切，輸出扁平檔名。
+segment_face:
+  input_dir: /ssd8/chihyu/Dataset/DeepFake_Dataset/DFDC-Frame
+  normal_output_dir: /ssd8/chihyu/Dataset/DeepFake_Dataset/DFDC-Frame-CropFace_normal
+  anomaly_output_dir: /ssd8/chihyu/Dataset/DeepFake_Dataset/DFDC-Frame-CropFace_anomaly
+  parser_model: SegFace-SwinB-CelebAMaskHQ-512  # AAAI 2025，作者官方權重
+  parser_revision: 5e093b03c0523f7f32a9845bbbc75ecb027c8bee
+  model_dir: models/segface
+  checkpoint: swinb_celeba_512/model.safetensors  # 官方 checkpoint 轉成純權重，避免依賴訓練物件
+  face_ids: [2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15]  # SegFace 類別：皮膚、耳朵、眉眼鼻嘴、眼鏡
+  background_ids: [0, 1, 3, 14, 16, 17, 18]  # 背景、脖子、衣服、頭髮、帽子、飾品
+  pixel_confidence: 0.5
+  dilation_ratio: 0.05  # 向外擴張半徑 = ceil(輸入較短邊 × 此比例)，224 像素時為 12
+  closing_ratio: 0.01  # 閉運算補小裂縫，再填滿遮罩內部孔洞
+  min_face_area: 0.02  # 擴張前人臉至少占輸入 2%，否則記錄 no_face
+  background: black  # black：遮罩外設黑色；keep：只裁外接框、保留框內背景
+  jpeg_quality: 95
+  device: auto
+  batch_size: 4
+  cpu_threads: 4  # run.sh 單任務設定；mission.sh 會依分配核心數覆寫
+  labels: all  # real→normal，fake→anomaly；也可單獨選 real / fake
+  parts: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]  # null 表示全部資料分包
+  frames_per_video: 10  # 均勻抽樣，不足則全部使用；null 表示全部有效幀
+  overwrite: false  # 已有 JPG 直接略過；調整裁切參數後可加 --overwrite 重做
+  limit: null  # 每個類別的來源影片數量上限，分派程序前套用；null 表示全部
+
+# RetinaFace 切臉任務（bash mission.sh）。共用上方 data_root、num_frames、split、limit、overwrite。
+crop_face:
+  data_root: /ssd2/DeepFakes/deepFakeChallenge
+  label_csv: /ssd2/DeepFakes/DFDC_list/test.csv  # null 時使用 Celeb-DF 官方切分
+  split: test
+  output_dir: /ssd8/chihyu/Dataset/DeepFake_Dataset/DFDC
+  cache_dir: outputs/retinaface_cache  # 首次執行自動下載 RetinaFace 權重
+  device: cpu  # cpu 或 cuda:0；多個工作會共用指定的 GPU
+  workers: 8  # 平行工作程序數，每個程序載入一份模型
+  cpu_threads: 2  # 每個程序的 CPU 推論執行緒數
+  threshold: 0.9
+  margin: 0.2  # 裁切框每側增加人臉寬／高的 20%
+  image_size: 224
+  detection_size: 640  # 偵測輸入最長邊上限；裁切仍取自原始畫面

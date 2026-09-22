@@ -1,0 +1,7 @@
+{
+  "code_revision": "9416628e7b5a3e4b9a1068b8467bdc0cf0be7a7d",
+  "weight_revision": "5e093b03c0523f7f32a9845bbbc75ecb027c8bee",
+  "weight_file": "swinb_celeba_512/model_299.pt",
+  "weight_sha256": "320b1c167191804913323b229a5256b1fc71f1987161fc54dc440e59af45dae8",
+  "inference_file": "swinb_celeba_512/model.safetensors"
+}

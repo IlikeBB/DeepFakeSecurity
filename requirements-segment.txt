@@ -1,0 +1,10 @@
+# pt230 already includes these packages; install only if missing.
+torch>=2.3
+torchvision>=0.18
+huggingface-hub
+safetensors
+numpy
+Pillow
+opencv-python
+scipy
+PyYAML
