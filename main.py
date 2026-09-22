@@ -19,6 +19,7 @@ def parse_args(argv=None):
     config.pop("feature_bank", None)
     config.pop("segment_face", None)
     config.pop("mission", None)
+    config.pop("patch_bank", None)
     parser = argparse.ArgumentParser(description="Extract DINOv3 features from Celeb-DF videos.")
     parser.add_argument("--data-root", type=Path)
     parser.add_argument("--model-path", type=Path)
@@ -57,16 +58,16 @@ def parse_args(argv=None):
 
 if __name__ == "__main__":
     selector = argparse.ArgumentParser(add_help=False)
-    selector.add_argument("--task", choices=("feature-bank", "segment-face", "extract"), default="feature-bank")
+    selector.add_argument("--task", choices=("feature-bank", "patch-bank", "segment-face", "extract"), default="feature-bank")
     task, remaining = selector.parse_known_args()
     if task.task == "segment-face":
         from script.segment_face import main
 
         main(remaining)
-    elif task.task == "feature-bank":
+    elif task.task in ("feature-bank", "patch-bank"):
         from script.feature_bank import main
 
-        main(remaining)
+        main(remaining, profile="patch_bank" if task.task == "patch-bank" else "feature_bank")
     else:
         args = parse_args(remaining)
         from script.extract import extract

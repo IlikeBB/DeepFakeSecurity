@@ -1,5 +1,164 @@
 # DeepFakeSecurity
 
+## 全量實驗：Stage 1 建庫、Stage 2 驗證
+
+```bash
+cd /ssd8/chihyu/Project/DeepFakeSecurity
+
+# 可先查看全量切分，只寫入設定與來源清單，不提取特徵或訓練
+bash run.sh stage1 --stage prepare
+
+# Stage 1：提取訓練特徵、訓練 adapter、儲存原始及調整後的 real bank
+bash run.sh stage1 --device cuda:1
+
+# Stage 1 完成後才執行 Stage 2：提取保留資料、校準門檻、評估與輸出熱圖
+bash run.sh stage2 --device cuda:1
+```
+
+這兩個入口固定使用 `--full-data` 與新實驗名稱 `dfdc_patch_full_v1`。
+「全量」是全部現有 segmentation JPG 納入資料池，包含所有現有幀，
+不受 `bank_videos`、`calibration_videos`、`eval_*_videos`、`max_frames` 的抽樣上限限制。
+它不會自動從原始影片補抽圖片，也不會把驗證資料放入 bank。
+
+全量切分採固定 seed：real 來源家族約 70% 建庫／訓練、15% 校準，其餘驗證；
+校準挑選沒有 fake 衍生圖片進入本資料池的 real 家族，確保校準只使用 real，且所有圖片皆可分派。
+同家族 fake 隨其 real 分入訓練或驗證；只有 fake 的家族按 70%／30% 分入訓練／驗證。
+訓練內允許 real 與其 fake 衍生影片共存，但訓練、校準、驗證三者的來源家族互不重疊。
+因此全量模式與舊版小規模實驗的切分策略不同。
+
+目前資料核對結果（2026-09-23）：
+
+| 分組 | 影片數 | 圖片數 |
+| --- | --- | --- |
+| real bank／訓練 | 200 | 1,997 |
+| fake 訓練候選池 | 1,435 | 14,344 |
+| real 校準 | 43 | 429 |
+| real＋fake 驗證 | 655 | 6,549 |
+
+共使用 23,319 張現有圖片。fake 候選池全量提取特徵，但訓練仍每 5 步抽最多 2 張，
+不是把全部 fake 混入每一批，也不保證每張 fake 都參與梯度更新。
+`train_fake_videos` 在全量模式下不限制候選池大小；設為 0 仍可關閉 fake 輔助。
+fake 特徵僅在加入訓練時載入當批，避免整個候選池佔滿 GPU。
+
+Stage 1 不提取或評分校準／驗證圖片；完成後會寫入 `stage1_complete.json`。
+Stage 2 會檢查完成紀錄與權重，使用凍結後的 bank 與 adapter，不重新訓練。
+兩階段要使用相同實驗名稱及資料／訓練參數；如果 Stage 1 覆寫參數，Stage 2 也要帶上相同值。
+預設模型、epoch、fake 間隔與權重沿用 YAML 的 `patch_bank`，比例目前固定於 `bank_flat.py`。
+
+bank 位於 `RAG/general/dfdc_patch_full_v1/`；驗證指標位於
+`outputs/feature_bank/dfdc_patch_full_v1/metrics.json`，圖片分數在 `evaluation_scores.json`。
+這仍是 DFDC test 清單內重新切分的實驗，不是官方 test 評分；此處只核對切分，尚未執行全量訓練。
+
+## 局部 feature bank 與 real 為主的訓練
+
+新增 `patch-bank` 任務，直接讀取目前扁平命名的 `DFDC-Frame-CropFace_normal` 與
+`DFDC-Frame-CropFace_anomaly`。DINOv3 全程凍結，每張人臉獨立提取最後一層
+`14×14×768` patch 特徵並存為 NPY；不做影片特徵平均。
+本任務設定集中在 `utils/config.yaml` 的 `patch_bank`，未覆寫的值繼承 `feature_bank`。
+
+```bash
+cd /ssd8/chihyu/Project/DeepFakeSecurity
+
+# 啟用 pt230 → main.py → 提取、訓練、建庫與評估；預設單 GPU cuda:1
+bash run.sh
+
+# mission.sh 也可派送同一任務；此任務使用 --device，不使用 segmentation 的 --gpus/--cores
+bash mission.sh patch-bank --device cuda:1
+
+# 完全不使用 fake 訓練；測試集仍包含 fake
+bash run.sh real-only
+
+# 關閉 adapter，取得未訓練 DINOv3 的基準；保留相同來源切分
+bash run.sh baseline
+
+# 調整 fake 加入間隔、權重；變更實驗設定需另取名稱
+bash run.sh adapter --fake-interval 10 --fake-weight 0.05 --experiment dfdc_patch_sparse_fake_v1
+```
+
+`run.sh` 內已用中文註解列出三種實驗流程，每次執行一個實驗；`bash run.sh --help`
+可查看中文說明。省略模式時預設為 `adapter`，可在腳本的 `default_experiment` 修改。
+GPU 與訓練參數仍由 YAML 管理，命令列覆寫優先；原本 `--task ...` 的明確任務指令仍可使用。
+
+預設資料分工如下，每支影片最多均勻抽 10 張：
+
+| 用途 | 影片數 | 參與訓練／建庫 |
+| --- | --- | --- |
+| real 訓練與 bank | 8 | 訓練 adapter，且只有這些 real 進入 bank |
+| fake 訓練輔助 | 2 | 偶爾參與圖片層級的異常排序損失，不進 bank |
+| real 校準 | 4 | 不參與訓練，只設定圖片分數門檻與熱圖色階 |
+| real／fake 測試 | 各 4 | 不參與訓練或門檻設定 |
+
+依來源 CSV 驗證 normal／anomaly 標籤，並依 DFDC 原始 `metadata.json` 的 `original`
+欄位隔離原片與其偽造衍生影片。固定 seed、先分影片家族再抽幀；不是按圖片隨機切分。
+這是 DFDC test 清單內的前測實驗，**不是官方 test 結果，也不保證人物身分互斥**。
+`train_fake_videos: 0` 會重新分組，因此與保留 fake 訓練組的實驗不一定使用相同 bank。
+
+訓練的只有 `768→128→768` residual adapter，初始為原表徵方向的恆等映射：
+
+- real：向其他來源影片的正常 patch 靠近，搜尋時排除自身影片，避免自我匹配。
+- 保留特徵：限制調整後與原始 DINOv3 特徵方向的偏差，降低表徵塌縮風險。
+- fake：每 `fake_interval: 5` 個 real 步驟加入最多 `fake_batch_size: 2` 張，
+  以 `fake_weight: 0.1` 加入圖片分數排序損失。圖片分數為最高 10% patch 距離平均；
+  不把 fake 圖片內的每個 patch 都標成偽造。fake 抽樣由 seed 決定，間隔跨 epoch 累計。
+
+訓練用參考集合只從 bank real 分層抽最多 2,048 個 patch，推論使用完整 real bank。
+訓練後使用同一 adapter 轉換 bank 與待測圖片，再做 L2 正規化、精確 cosine 最近鄰搜尋。
+門檻來自獨立 real 校準圖片分數的第 99 百分位；少量校準資料不保證實際誤報率為 1%。
+異常分數表示偏離 bank 的程度，**不是 fake 機率**。
+
+這是可控制的 metric adaptation 實驗，並非某篇論文的完整重現；設計背景可參考
+[AnomalyDINO](https://openaccess.thecvf.com/content/WACV2025/papers/Damm_AnomalyDINO_Boosting_Patch-Based_Few-Shot_Anomaly_Detection_with_DINOv2_WACV_2025_paper.pdf)
+的正常 patch bank，以及 [Deep SAD](https://arxiv.org/abs/1906.02694) 的少量已知異常輔助概念。
+目前保留全部 patch（含黑色背景與裁切邊界），尚未加入語意部位限制或 mask 篩選；
+熱圖僅呈現 patch 異常距離，不是經像素標註驗證的偽造區域。
+
+```text
+RAG/general/dfdc_patch_adapter_v1/
+  bank_config.json、splits.json、manifest.jsonl、patch_index.json
+  visualization.json                       # 僅 real bank 擬合的 PCA 色彩設定
+  dfdc_train_part_N/<video>/
+    frame_XXXXXX.npy、frame_XXXXXX.json     # 原始 DINOv3 特徵與來源紀錄
+    preview.jpg                            # 每支 real bank 影片一張 PCA 預覽
+  adapted/dfdc_train_part_N/<video>/
+    frame_XXXXXX.npy                        # 同一 adapter 轉換後的 real 特徵
+
+outputs/feature_bank/dfdc_patch_adapter_v1/
+  training/adapter.safetensors、adapter.json # 權重、來源雜湊、每 epoch 損失與 fake 次數
+  train_fake/、calibration/、evaluation/    # 各組原始 NPY 與來源紀錄
+  evaluation/heatmaps/<part>/<video>/preview.jpg
+  thresholds.json、metrics.json、evaluation_scores.json
+  predictions/<image_hash>/               # 單張推論分數、距離 NPY、最近鄰 ID 與熱圖
+```
+
+原始與調整後 NPY 不互相覆寫；PCA 預覽顯示原始特徵，異常熱圖顯示實際搜尋結果。
+熱圖共用由 real 校準資料決定的色階，每支測試影片儲存一張代表幀；圖片分數仍逐張計算。
+`adapted/` 對應同實驗的 adapter；載入權重與推論門檻時會檢查設定、切分與權重雜湊。
+來源 JPG 若變動，會拒絕沿用舊特徵。來源資料夾維持只有圖片，不新增任何紀錄。
+
+可拆開執行 `--stage prepare`、`extract`、`train`、`evaluate`；預設 `all` 依序完成。
+相同設定重跑會沿用已完成特徵與 adapter checkpoint，再重新評估；不會額外追加 epoch。
+若中途訓練尚未完成，重跑會由固定 seed 重新訓練。改變設定請使用新的 `--experiment`。
+單張推論需要先完成校準，輸入須採用相同的人臉裁切／segmentation 流程：
+
+```bash
+bash run.sh --task patch-bank --stage predict --image /absolute/path/to/segmented_face.jpg
+```
+
+程式分工：`bank_flat.py` 管理來源與切分、`bank_encoder.py` 提取凍結 DINOv3 表徵、
+`bank_adapter.py` 訓練與載入調整層、`bank_search.py` 搜尋、`bank_heatmap.py` 繪圖；
+`feature_bank.py` 串接流程。原本只匯出 real NPY 的流程改用 `bash run.sh --task feature-bank`。
+
+2026-09-23 小規模實測使用上述預設與相同切分，測試共 40 張 real、40 張 fake：
+
+| 實驗 | 圖片 AUROC | real 誤報率 | fake 檢出率 |
+| --- | --- | --- | --- |
+| 凍結 DINOv3、無 adapter | 0.3956 | 7.5% | 2.5% |
+| real 為主＋間歇 fake adapter | 0.3863 | 7.5% | 2.5% |
+
+adapter 共訓練 50 步，fake 批次加入 10 次。此結果表示流程可執行，但**目前表徵與訓練方式
+尚未有效區分真假，也未改善基準**；僅 8 支測試影片，不能據此推論跨資料集能力。
+保留原始結果供比較，不依測試集調整分數方向或門檻。
+
 ## mission.sh 使用方式
 
 `mission.sh` 是多任務 shell 入口，會切換至專案目錄、載入 Conda 並啟用 `pt230`。
@@ -14,9 +173,10 @@ bash mission.sh --help
 | --- | --- | --- |
 | `bash mission.sh segment-face` | 對已裁切的人臉做 SegFace 分割與外擴裁切 | 每張指定 GPU 一個程序，或 CPU 多程序 |
 | `bash mission.sh crop-face` | 從原始影片抽幀，用 RetinaFace 切臉 | 依 `crop_face.workers` 啟動多個工作程序 |
+| `bash mission.sh patch-bank` | 局部表徵、real 為主的 adapter 訓練與評估 | 單 GPU，由 `--device` 指定 |
 | `bash mission.sh` | 預設執行 `crop-face` | 同上 |
 
-兩個任務分別啟動，不會自動串接。`segment-face` 讀取 `segment_face.input_dir` 指定的
+各任務分別啟動，不會自動串接。`segment-face` 讀取 `segment_face.input_dir` 指定的
 現成人臉資料；首次使用 SegFace 前，先下載模型：
 
 ```bash
@@ -147,14 +307,14 @@ DFDC-Frame-CropFace_normal/
 `parts: null` 表示全部分包，`frames_per_video: null` 表示使用全部有效幀。
 `script/segment_face.py` 管理資料與命名；`script/face_parser.py` 管理模型推論；
 `script/face_crop.py` 管理遮罩外擴與裁切。官方模型原始碼與版本紀錄獨立存於 `models/segface/`。
-目前下方 feature bank 仍讀取原本巢狀的 DFDC-Frame；扁平資料集接入 bank 的讀取流程尚未變更。
+下方舊版 feature bank 仍讀取巢狀的 DFDC-Frame；目前扁平的 segmentation 輸出請使用上方 `patch-bank` 任務。
 
 參考：[SegFace 官方程式](https://github.com/Kartik-3004/SegFace)、
 [作者權重](https://huggingface.co/kartiknarayan/SegFace)、[論文](https://arxiv.org/abs/2412.08647)。
 
 ## Real feature bank：NPY 與 JPG 預覽
 
-`bash run.sh` 自動啟用 `pt230`，透過 `main.py` 執行 `feature_bank.stage: build`。
+`bash run.sh --task feature-bank` 自動啟用 `pt230`，透過 `main.py` 執行 `feature_bank.stage: build`。
 所有參數集中在 `utils/config.yaml` 的 `feature_bank`；模型共用頂層 `model_path`。
 目前只從已裁切的人臉中選 real 建庫，不做校準、評估或影片特徵聚合。
 
@@ -190,10 +350,10 @@ RAG/general/dfdc_real_bank_v2/
 
 ```bash
 # 使用可用的 GPU；auto 預設用 cuda:0，沒有 CUDA 則用 CPU
-bash run.sh --device cuda:1
+bash run.sh --task feature-bank --device cuda:1
 
 # 少量測試：2 個 real 來源資料夾，各 2 張人臉
-bash run.sh --experiment bank_trial --bank-videos 2 --max-frames 2 --device cuda:1
+bash run.sh --task feature-bank --experiment bank_trial --bank-videos 2 --max-frames 2 --device cuda:1
 
 # 核心測試
 conda run -n pt230 python -m unittest discover -s tests -v

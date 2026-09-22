@@ -46,6 +46,8 @@ def select_groups(candidates, config):
     used = set()
 
     def take(pool, count):
+        if count == 0:
+            return []
         chosen = []
         for video in pool:
             if video["group_id"] not in used:
@@ -57,10 +59,14 @@ def select_groups(candidates, config):
 
     # Reserve fake source families before selecting real reference samples.
     eval_fake = take(fake, config["eval_fake_videos"])
+    train_fake = take(fake, config.get("train_fake_videos", 0))
     bank = take(real, config["bank_videos"])
     calibration = take(real, config["calibration_videos"])
     eval_real = take(real, config["eval_real_videos"])
-    return {"bank": bank, "calibration": calibration, "evaluation": eval_real + eval_fake}
+    groups = {"bank": bank, "calibration": calibration, "evaluation": eval_real + eval_fake}
+    if train_fake:
+        groups["train_fake"] = train_fake
+    return groups
 
 
 def prepare_plan(config, bank_only=False):

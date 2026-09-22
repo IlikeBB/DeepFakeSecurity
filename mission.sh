@@ -3,17 +3,19 @@ set -eo pipefail
 
 task="${1:-crop-face}"
 case "$task" in
-  crop-face|segment-face) if (($#)); then shift; fi ;;
+  crop-face|segment-face|patch-bank) if (($#)); then shift; fi ;;
   --help|-h)
     cat <<'HELP'
 Usage:
   bash mission.sh segment-face [options]  # configurable CPU/GPU parallel jobs
   bash mission.sh crop-face [options]     # original RetinaFace worker pool
+  bash mission.sh patch-bank [options]    # feature extraction, adapter training and evaluation
 
 Segmentation defaults: parts 0-10, up to 10 frames/video, JPG only.
 Resources: --cores 8 --gpus 1,2 (two GPUs), or --gpus none --cpu-workers 4.
 Use --dry-run to inspect allocation without processing images.
 GPU assignments and data paths: utils/config.yaml.
+patch-bank uses --device cuda:1 (one GPU), not segmentation's --cores/--gpus options.
 Example: bash mission.sh segment-face --limit 1
 --limit applies per class before distributing videos across workers.
 --parts and --frames-per-video override YAML.
@@ -30,6 +32,9 @@ conda activate pt230
 
 if [[ "$task" == crop-face ]]; then
   exec python -u script/crop_face.py "$@"
+fi
+if [[ "$task" == patch-bank ]]; then
+  exec python -u main.py --task patch-bank "$@"
 fi
 
 # Keep shell task dispatch simple; Python manages core allocation, GPU jobs and cleanup.

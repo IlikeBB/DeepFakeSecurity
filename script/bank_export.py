@@ -58,7 +58,8 @@ def build_bank(plan, args, root):
         stat = source.stat()
         if (stat.st_size, stat.st_mtime_ns) != (record["size"], record["mtime_ns"]):
             raise ValueError(f"Crop changed since sampling: {source}")
-        relative = source.relative_to(args.faces_dir).with_suffix(".npy")
+        relative = (Path(record["feature_path"]) if "feature_path" in record else
+                    source.relative_to(args.faces_dir).with_suffix(".npy"))
         record["feature_path"] = relative.as_posix()
         previews.setdefault(relative.parent, record)
     model = processor = None

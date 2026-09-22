@@ -39,6 +39,33 @@ feature_bank:
   query_chunk_size: 1024
   bank_chunk_size: 16384
 
+# bash run.sh --task patch-bank：繼承 feature_bank，以下為小規模基準實驗覆寫值。
+patch_bank:
+  input_layout: flat
+  stage: all
+  experiment: dfdc_patch_adapter_v1
+  normal_dir: /ssd8/chihyu/Dataset/DeepFake_Dataset/DFDC-Frame-CropFace_normal
+  anomaly_dir: /ssd8/chihyu/Dataset/DeepFake_Dataset/DFDC-Frame-CropFace_anomaly
+  bank_videos: 8
+  calibration_videos: 4
+  eval_real_videos: 4
+  eval_fake_videos: 4
+  max_frames: 10
+  device: cuda:1
+  batch_size: 8
+  train_adapter: true  # DINOv3 凍結，只訓練局部特徵 residual adapter
+  train_fake_videos: 2  # 訓練專用 fake；0 表示 real-only 訓練，測試 fake 仍獨立保留
+  train_epochs: 5
+  train_batch_size: 8
+  adapter_hidden: 128
+  learning_rate: 0.0001
+  reference_patches: 2048  # 訓練用 real patch 子集；推論仍使用完整 real bank
+  anchor_weight: 1.0  # 保留原始 DINOv3 特徵方向，降低表徵塌縮風險
+  fake_interval: 5  # 每 5 個 real 步驟插入一小批 fake，跨 epoch 累計
+  fake_batch_size: 2
+  fake_weight: 0.1
+  fake_margin: 0.1  # 希望 fake 的圖片分數高於本批 real 分數的幅度
+
 # mission.sh 的總資源預算；GPU 模式每張卡一個程序，影片平均分配。
 mission:
   cpu_cores: 8  # 總邏輯 CPU 核心數，以 CPU affinity 限制，再平均分配給程序
