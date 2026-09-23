@@ -176,7 +176,9 @@ def main(argv=None):
                 from script.dino_lora import tuning_info
 
                 tuning_info(output, args, bank)
-            load_index(plan, bank, output)  # 先驗證 real 索引完整性，再讀取校準／測試圖片。
+            _, _, arrays = load_index(plan, bank, output)  # 先驗證 real 索引完整性與顯存。
+            from script.bank_search import check_device_memory
+            check_device_memory(arrays["features"], args.devices, args.query_chunk_size, args.bank_chunk_size)
             if args.method == "cross_attention":
                 from script.bank_attention import attention_info
                 attention_info(output)

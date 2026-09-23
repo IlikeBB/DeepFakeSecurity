@@ -119,6 +119,11 @@ def extract_roles(plan, roles, bank, cache, args):
                 with progress.get_lock():
                     progress.update(min(args.batch_size, len(shard) - start))
             del model, processor
+            if device.startswith("cuda"):
+                # DINO is no longer needed; Stage 2 reuses the same device for
+                # the much larger retrieval bank.
+                import torch
+                torch.cuda.empty_cache()
         map_devices(worker, shards, devices)
 
 

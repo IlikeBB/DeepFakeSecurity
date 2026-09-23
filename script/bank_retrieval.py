@@ -153,17 +153,24 @@ def evaluate(plan, args, bank, cache, output):
     shards = [rows[i::len(devices)] for i in range(len(devices))]
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool, tqdm(
+            total=len(arrays["features"]) * len(devices), desc="Stage 2：載入 FP16 bank",
+            unit="patch", unit_scale=True, dynamic_ncols=True) as loading, tqdm(
             total=len(rows), desc="Stage 2 檢索", unit="image", dynamic_ncols=True, mininterval=.5) as progress:
+        def loaded(count):
+            with loading.get_lock():
+                loading.update(count)
+
         def worker(shard, device):
             if not shard:
                 return []
             if method == "nearest":
-                search = PatchBank(arrays["features"], device, args.query_chunk_size, args.bank_chunk_size)
+                search = PatchBank(arrays["features"], device, args.query_chunk_size, args.bank_chunk_size,
+                                   progress=loaded)
             else:
                 from script.bank_attention import ReferenceBank, load_attention
                 model = load_attention(attention, device) if attention else None
                 search = ReferenceBank(arrays["features"], device, args.query_chunk_size, args.bank_chunk_size,
-                                       args.attention, model=model)
+                                       args.attention, model=model, progress=loaded)
             result = []
             def read(row):
                 return load_sample(cache / row["role"], row)[1]

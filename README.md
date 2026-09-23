@@ -178,9 +178,14 @@ Stage 2 載入 Stage 1 的同一 encoder 與 real bank，接著：
 
 1. 提取 `calibration` 與 `evaluation` 圖片的 patch features。
 2. 讓每個前景 patch 查詢 real bank，取得異常距離與參考來源。
+
 3. 將最高 `top_fraction` 距離取平均；預設使用最高 10% patch。
 4. 只用 calibration real 分數的第 `threshold_quantile` 分位設定門檻；預設 99%。
 5. 對 evaluation real/fake 計算 AUROC、AP、FPR、TPR，並保存完整 patch 匹配證據。
+
+Stage 2 會在提取圖片特徵前檢查每張 GPU 的可用顯存。目前完整 bank 約含 602 萬個 patch，
+每張檢索 GPU 需要約 10 GiB 可用顯存；不足時程式會直接列出各 GPU 的需求，不會停在 0%。
+載入時另有 `Stage 2：載入 FP16 bank` 進度列。
 
 | `retrieval.method` | Patch 異常距離 |
 | --- | --- |

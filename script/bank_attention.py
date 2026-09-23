@@ -36,15 +36,16 @@ class CrossAttention(nn.Module):
 
 
 class ReferenceBank(PatchBank):
-    def __init__(self, bank, device, query_chunk_size, bank_chunk_size, config, model=None, families=None):
-        super().__init__(bank, device, query_chunk_size, bank_chunk_size)
+    def __init__(self, bank, device, query_chunk_size, bank_chunk_size, config, model=None, families=None,
+                 progress=None):
+        super().__init__(bank, device, query_chunk_size, bank_chunk_size, progress=progress)
         self.config, self.model = config, model
         self.families = None if families is None else torch.as_tensor(families, device=device)
 
     @torch.no_grad()
     def nearest(self, query, excluded=None):
         """Exact chunked Top-K; excluded gives each query's source-family ID."""
-        query = F.normalize(torch.as_tensor(query, dtype=torch.float32, device=self.bank.device), dim=-1)
+        query = F.normalize(torch.as_tensor(query, dtype=self.bank.dtype, device=self.bank.device), dim=-1)
         if query.ndim != 2 or query.shape[1] != self.bank.shape[1] or not torch.isfinite(query).all():
             raise ValueError("Invalid retrieval query")
         if torch.any(query.norm(dim=-1) == 0):
@@ -59,7 +60,7 @@ class ReferenceBank(PatchBank):
         all_values, all_ids = [], []
         for start in range(0, len(query), self.query_chunk_size):
             q = query[start:start + self.query_chunk_size]
-            best = torch.empty((len(q), 0), device=q.device)
+            best = torch.empty((len(q), 0), device=q.device, dtype=self.bank.dtype)
             ids = torch.empty((len(q), 0), device=q.device, dtype=torch.long)
             for offset in range(0, len(self.bank), self.bank_chunk_size):
                 similarities = q @ self.bank[offset:offset + self.bank_chunk_size].T
@@ -75,7 +76,7 @@ class ReferenceBank(PatchBank):
                 raise ValueError("Not enough cross-family patches for Top-K")
             all_values.append(best)
             all_ids.append(ids)
-        return torch.cat(all_values), torch.cat(all_ids)
+        return torch.cat(all_values).float(), torch.cat(all_ids)
 
     @torch.inference_mode()
     def score_candidates(self, query, candidate_ids, max_per_family):
@@ -84,7 +85,7 @@ class ReferenceBank(PatchBank):
             raise ValueError("Family IDs required for capped candidate scoring")
         query = F.normalize(torch.as_tensor(query, dtype=torch.float32, device=self.bank.device), dim=-1)
         ids = torch.as_tensor(candidate_ids, device=self.bank.device)
-        candidates = self.bank[ids]
+        candidates = self.bank[ids].float()
         similarities = (query[:, None] * candidates).sum(-1)
         families = self.families[ids]
         keep = torch.ones_like(similarities, dtype=torch.bool)
@@ -100,7 +101,7 @@ class ReferenceBank(PatchBank):
             raise ValueError("Reference scoring expects one image at a time")
         query = F.normalize(torch.as_tensor(patches[0], dtype=torch.float32, device=self.bank.device), dim=-1)
         similarities, ids = self.nearest(query)
-        candidates = self.bank[ids]
+        candidates = self.bank[ids].float()
         weights = (similarities / self.config["temperature"]).softmax(-1)
         weighted = torch.einsum("bk,bkd->bd", weights, candidates)
         distances = {"nearest": (1 - similarities[:, 0]).clamp(0, 2),
