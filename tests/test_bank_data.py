@@ -3,8 +3,13 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import numpy as np
 
 from script.bank_data import prepare_plan
+from script.retrieval_io import extract_roles
 
 
 class BankDataTests(unittest.TestCase):
@@ -56,6 +61,20 @@ class BankDataTests(unittest.TestCase):
             self.assertEqual(row["crop_settings"]["face_source"], "segface")
             self.assertEqual([frame["image_path"] for frame in row["frames"]], [str(segmented)])
             self.assertEqual(row["frames"][0]["frame_index"], 0)
+            self.assertEqual(row["frames"][0]["feature_path"],
+                             f"{part}/{video}/frame_000000.npy")
+
+            # Splits created before feature_path was added must remain resumable.
+            row["frames"][0].pop("feature_path")
+            bank, cache = root / "bank", root / "cache"
+            args = SimpleNamespace(devices=[], workers=1, batch_size=1, dtype="float16")
+            features = np.ones((1, 14, 14, 3), dtype=np.float16)
+            with patch("script.retrieval_io.load_encoder", return_value=(object(), object())), \
+                    patch("script.retrieval_io.encode", return_value=(None, features)):
+                extract_roles(plan, ("bank",), bank, cache, args)
+            feature = bank / part / video / "frame_000000.npy"
+            self.assertTrue(feature.is_file())
+            self.assertTrue(feature.with_suffix(".json").is_file())
 
 
 if __name__ == "__main__":

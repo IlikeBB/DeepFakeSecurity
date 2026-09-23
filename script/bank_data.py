@@ -162,7 +162,8 @@ def prepare_plan(config, bank_only=False):
         selected = []
         for i in indices:
             frame, path = frames[i]
-            selected.append({"image_path": str(path), "frame_index": frame["frame_index"]})
+            selected.append({"image_path": str(path), "frame_index": frame["frame_index"],
+                             "feature_path": f"{part}/{stem}/frame_{frame['frame_index']:06d}.npy"})
         candidates.append({"video_id": f"{part}/{stem}", "group_id": f"{part}/{group}",
                            "label": labels[stem], "source": data["source"],
                            "crop_settings": dict(data["settings"], face_source=face_source), "frames": selected})
@@ -195,7 +196,10 @@ def image_records(videos, role):
     records = []
     for video in videos:
         for frame in video["frames"]:
-            records.append(dict(frame, sample_id=len(records), role=role, video_id=video["video_id"],
+            feature_path = frame.get(
+                "feature_path", f"{video['video_id']}/frame_{frame['frame_index']:06d}.npy")
+            records.append(dict(frame, feature_path=feature_path, sample_id=len(records), role=role,
+                                video_id=video["video_id"],
                                 group_id=video["group_id"], label=video["label"],
                                 crop_settings=video["crop_settings"]))
     return records
