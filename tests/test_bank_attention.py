@@ -38,6 +38,15 @@ class AttentionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Not enough"):
             ReferenceBank(bank, "cpu", 2, 3, self.config(), families=np.zeros(19)).nearest(query, np.zeros(5))
 
+    def test_existing_topk_caps_each_source_family(self):
+        bank = np.eye(8, dtype=np.float32)
+        query = np.array([[1., 1., 1., 1., .8, .7, .6, .5]], dtype=np.float32)
+        families = np.array([0, 0, 0, 0, 1, 2, 3, 4])
+        search = ReferenceBank(bank, "cpu", 2, 3, self.config(), families=families)
+        distance, keep = search.score_candidates(query, np.arange(8)[None], 1)
+        np.testing.assert_array_equal(keep, [[True, False, False, False, True, True, True, True]])
+        self.assertTrue(np.isfinite(distance).all())
+
     def test_attention_has_gradients_and_can_only_mix_reference_values(self):
         torch.manual_seed(7)
         model = CrossAttention(8, 8, 2)

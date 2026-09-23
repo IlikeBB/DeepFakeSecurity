@@ -21,7 +21,7 @@ def parse_args(argv=None):
                     normal_dir=config["patch_bank"]["normal_dir"], anomaly_dir=config["patch_bank"]["anomaly_dir"],
                     source_root=config["feature_bank"]["source_root"], label_csv=config["feature_bank"]["label_csv"])
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--stage", choices=("prepare", "stage1", "stage2", "all"), default="stage1")
+    parser.add_argument("--stage", choices=("prepare", "stage1", "stage2", "ablation", "all"), default="stage1")
     parser.add_argument("--exper", "--experiment", dest="experiment")
     parser.add_argument("--gpus", dest="gpu_ids", type=int, nargs="*", help="GPU IDs; empty list uses CPU")
     parser.add_argument("--batch-size", "--extract-batch-size", dest="batch_size", type=int)
@@ -66,6 +66,43 @@ def parse_args(argv=None):
                 or any(not math.isfinite(config[key]) or config[key] <= 0 for key in ("temperature", "learning_rate"))
                 or any(not math.isfinite(config[key]) or config[key] < 0 for key in ("noise_std", "weight_decay"))):
             parser.error("Invalid retrieval.attention configuration")
+    ablation = args.ablation
+    if (type(ablation["max_per_family"]) is not int or ablation["max_per_family"] < 1
+            or not math.isfinite(ablation["boundary_weight"])
+            or not 0 <= ablation["boundary_weight"] <= 1):
+        parser.error("Invalid retrieval.ablation configuration")
+    tuning = args.encoder_tuning
+    compression = tuning.get("compression", {})
+    local = tuning.get("local_anomaly", {})
+    integers = ("rank", "epochs", "patience", "batch_size", "images_per_epoch", "validation_images",
+                "fake_interval", "fake_batch_size")
+    positive = ("alpha", "learning_rate", "anchor_weight", "fake_margin", "gradient_clip")
+    if (type(tuning.get("enabled")) is not bool
+            or any(type(tuning.get(key)) is not int or tuning[key] < 1 for key in integers)
+            or any(not math.isfinite(tuning.get(key, 0)) or tuning[key] <= 0 for key in positive)
+            or not math.isfinite(tuning.get("weight_decay", -1)) or tuning["weight_decay"] < 0
+            or not math.isfinite(tuning.get("fake_weight", -1)) or tuning["fake_weight"] < 0
+            or not math.isfinite(tuning.get("minimum_delta", -1)) or tuning["minimum_delta"] < 0
+            or not 0 < tuning.get("validation_fraction", 0) < 1
+            or any(not isinstance(compression.get(key), list) or len(compression[key]) != 2
+                   or any(type(value) is not int for value in compression[key])
+                   or not 1 <= compression[key][0] <= compression[key][1] <= 100
+                   for key in ("mild_quality", "severe_quality"))
+            or any(not math.isfinite(compression.get(key, 0)) or not 0 < compression[key] <= 1
+                   for key in ("mild_scale", "severe_scale"))
+            or not math.isfinite(compression.get("affinity_weight", -1))
+            or compression["affinity_weight"] < 0
+            or not isinstance(local.get("quality"), list) or len(local["quality"]) != 2
+            or any(type(value) is not int for value in local["quality"])
+            or not 1 <= local["quality"][0] <= local["quality"][1] <= 100
+            or any(not math.isfinite(local.get(key, -1)) for key in
+                   ("scale", "minimum_fraction", "maximum_fraction", "mask_threshold", "margin", "weight",
+                    "background_weight"))
+            or not 0 < local["scale"] <= 1
+            or not 0 < local["minimum_fraction"] <= local["maximum_fraction"] < 1
+            or not 0 < local["mask_threshold"] <= 1 or local["margin"] <= 0
+            or local["weight"] < 0 or local["background_weight"] < 0):
+        parser.error("Invalid retrieval.encoder_tuning configuration")
     return args
 
 
@@ -75,9 +112,10 @@ def main(argv=None):
     cache = bank / "cache"  # 輔助查詢特徵；不納入 real 檢索索引。
     output = Path(args.results_dir) / args.experiment
     completion = output / "stage1/retrieval.json"
-    if args.stage == "stage2" and not completion.is_file():
+    if args.stage in ("stage2", "ablation") and not completion.is_file():
         raise ValueError(f"請先執行 bash run.sh stage1 --exper {args.experiment}；找不到 {completion}")
-    runtime = {"stage", "gpu_ids", "devices", "workers", "cpu_threads", "batch_size", "query_chunk_size", "bank_chunk_size", "export_previews"}
+    runtime = {"stage", "gpu_ids", "devices", "workers", "cpu_threads", "batch_size", "query_chunk_size",
+               "bank_chunk_size", "export_previews", "ablation", "encoder_checkpoint"}
     spec = {key: value for key, value in vars(args).items() if key not in runtime}
     spec.update(schema="retrieval-v1", method=getattr(args, "method", "nearest"),
                 files_sha256={name: sha256(Path(args.model_path) / name)
@@ -105,6 +143,10 @@ def main(argv=None):
             write_json(output / "stage1/config.json", spec)
             write_json(output / "stage1/splits.json", plan)
         if args.stage in ("stage1", "all"):
+            if args.encoder_tuning["enabled"]:
+                from script.dino_lora import train_lora
+
+                train_lora(plan, args, bank, output)
             if not completion.exists():
                 extract_roles(plan, ("bank",), bank, cache, args)
             if args.export_previews:
@@ -116,9 +158,21 @@ def main(argv=None):
                 _, sources, arrays = load_index(plan, bank, output)
                 train_attention(sources, arrays, args, bank, output)
         if args.stage in ("stage2", "all"):
+            if args.encoder_tuning["enabled"]:
+                from script.dino_lora import tuning_info
+
+                tuning_info(output, args, bank)
             load_index(plan, bank, output)  # 先驗證 real 索引完整性，再讀取校準／測試圖片。
             if args.method == "cross_attention":
                 from script.bank_attention import attention_info
                 attention_info(output)
             extract_roles(plan, ("calibration", "evaluation"), bank, cache, args)
             evaluate(plan, args, bank, cache, output)
+        if args.stage == "ablation":
+            if args.encoder_tuning["enabled"]:
+                from script.dino_lora import tuning_info
+
+                tuning_info(output, args, bank)
+            extract_roles(plan, ("calibration", "evaluation"), bank, cache, args)
+            from script.bank_retrieval import evaluate_ablation
+            evaluate_ablation(plan, args, bank, cache, output)

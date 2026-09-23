@@ -1,5 +1,33 @@
 # DeepFakeSecurity
 
+## DINOv3 最後一層 LoRA 表徵實驗
+
+`retrieval.encoder_tuning.enabled: true` 時，Stage 1 會先在 DINOv3 最後一個 Transformer block
+的 Q/K/V 投影加入 LoRA。原始 DINOv3 權重保持凍結。壓縮訓練參考 UMCL 的跨品質概念，
+將同一張 real 人臉建立 clean、mild、severe 三個對齊分支，同時約束對應 patch 的 cosine
+一致性與 patch-to-patch affinity；JPEG quality 與縮放範圍集中在 `encoder_tuning.compression`。
+這裡使用 JPEG 模擬品質層級，數值不宣稱等同 FF++ 的 H.264 c23/c40。feature anchor 限制
+表徵漂移；真實 fake margin 預設關閉，只在 `fake_weight` 大於 0 時依 `fake_interval` 啟用。
+訓練與 validation 按來源 family 分離，validation loss 連續 5 個 epoch 未改善便停止。
+
+同一張 real 圖片也會產生一個局部 soft discrepancy。遮罩內 patch 使用 margin loss 推離原始
+real feature，遮罩外保持一致；`fake_weight: 0.0` 時整個 LoRA 訓練不讀取真實 fake。
+每個 epoch 只印一行平均 `total/comp/rel/local/bg/anchor/fake/val` loss，完整數值同步寫入
+`dino_lora_history.json`。
+
+LoRA 會改變所有 patch features，因此請先在 `utils/config.yaml` 的 `retrieval.experiment` 填入新名稱，
+不可沿用 frozen DINO 的實驗資料夾。啟動指令維持簡單：
+
+```bash
+bash run.sh stage1
+bash run.sh stage2
+```
+
+LoRA 權重、訓練歷史與設定分別寫入 `outputs/feature_bank/<exper>/stage1/dino_lora.safetensors`、
+`dino_lora_history.json` 與 `dino_lora.json`。Stage 1 完成訓練後使用多張 GPU 重建 real bank；
+Stage 2 會以同一份 LoRA 權重提取 calibration 與 evaluation 特徵。
+目前 `method: topk` 直接以 real bank cosine 相似度判斷；不額外訓練 cross-attention。
+
 ## ATT_DEMO：real bank 的 cross-attention 實驗
 
 在 `utils/config.yaml` 的 `retrieval` 管理設定，啟動方式不變：
@@ -53,6 +81,17 @@ outputs/feature_bank/ATT_DEMO/
 `anomaly_distance` 才是當前評分方法的 patch 誤差。
 `reference_patch_ids`／`reference_weights` 可追溯重建所用的全部候選；NPZ 中權重是當前方法的權重。
 Stage 1 允許續接已有 NPY 與索引；完整 attention 權重驗證後沿用，未完成的訓練從頭開始。
+
+完成 Stage 2 後，可以使用相同實驗執行一次固定的瓶頸消融：
+
+```bash
+bash run.sh ablation
+```
+
+設定位於 `retrieval.ablation`。程式同時比較原始 Top-K、前景邊界降權、每個來源家族限制候選數，
+以及兩者合併；四種方法各自使用相同 calibration real 校準門檻。預設邊界權重為 0.5，
+並在 Stage 2 已儲存的 Top-16 內讓每個來源家族最多保留 2 個。結果寫入
+`outputs/feature_bank/<exper>/ablations/boundary_family/report.json`，不覆寫 Stage 2 結果。
 
 ## 目前啟動方式：FB_01 real feature bank 相似度檢索
 
@@ -349,7 +388,50 @@ adapter 共訓練 50 步，fake 批次加入 10 次。此結果表示流程可�
 尚未有效區分真假，也未改善基準**；僅 8 支測試影片，不能據此推論跨資料集能力。
 保留原始結果供比較，不依測試集調整分數方向或門檻。
 
-## mission.sh 使用方式
+## mission.sh 目前狀態與使用方式
+
+目前可以直接用 `mission.sh` 啟動 Stage 1／Stage 2 feature bank 實驗。它會把任務轉交給
+`run.sh`，自動切換到專案目錄、啟用 Conda 環境 `pt230`，再執行
+`main.py --task bank-retrieval`：
+
+```bash
+cd /ssd8/chihyu/Project/DeepFakeSecurity
+
+# 先在 utils/config.yaml 設定 retrieval.experiment
+bash mission.sh stage1
+bash mission.sh stage2
+
+# 或連續執行兩個階段
+bash mission.sh all
+```
+
+GPU、讀取執行緒與 batch size 建議直接在 `utils/config.yaml` 的 `retrieval` 區塊設定；
+需要臨時覆寫時，可使用 `--gpus 4 5 6 --workers 16 --batch-size 8`。Stage 1 使用第一張
+GPU 訓練 LoRA，接著以全部指定 GPU 提取 real feature bank；Stage 2 使用相同實驗名稱與
+LoRA 權重進行校準和評估。
+
+`mission.sh` 也可執行已還原的 `segment-face` 與 `crop-face` 資料前處理。先查看所有入口：
+
+```bash
+bash mission.sh --help
+```
+
+資料已經切好時，不必重跑這兩項；直接執行上方 Stage 1 即可。需要重新處理資料時，建議先做
+小規模測試，再依下方舊版紀錄擴大範圍：
+
+```bash
+# SegFace：每類先測試一支影片，只檢查資源配置時加上 --dry-run
+bash mission.sh segment-face --limit 1 --cores 8 --gpus 4,5 --dry-run
+bash mission.sh segment-face --limit 1 --cores 8 --gpus 4,5
+
+# RetinaFace：先測試兩支原始影片，每支抽 4 幀
+bash mission.sh crop-face --limit 2 --num-frames 4 --workers 2 --device cpu
+```
+
+`patch-bank` 仍依賴已移除的 `script/feature_bank.py`，目前不可用；現行 feature bank 請使用
+`stage1`／`stage2`。已產生的 normal／anomaly JPG 可以直接供目前流程使用，不需要重新切臉。
+
+### 舊版 mission.sh 使用紀錄
 
 `mission.sh` 是多任務 shell 入口，會切換至專案目錄、載入 Conda 並啟用 `pt230`。
 執行前需確保終端機可使用 `conda`、已建立 `pt230`，並使用 Bash；CPU 綁定使用 Linux `taskset`。

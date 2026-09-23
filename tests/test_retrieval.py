@@ -8,11 +8,17 @@ import numpy as np
 from PIL import Image
 
 from script.bank_data import image_records, read_json, save_array, sha256, write_json
-from script.bank_retrieval import build, evaluate, foreground_patches, load_index
+from script.bank_retrieval import aggregate_patch_score, build, evaluate, foreground_patches, load_index
 from script.retrieval import main, parse_args
 
 
 class RetrievalTests(unittest.TestCase):
+    def test_boundary_weight_reduces_edge_anomaly_evidence(self):
+        ids = np.arange(9)
+        distances = np.array([1., 1., 1., 1., 0., 1., 1., 1., 1.])
+        self.assertEqual(aggregate_patch_score(distances, ids, (3, 3), 1.), 8 / 9)
+        self.assertEqual(aggregate_patch_score(distances, ids, (3, 3), 1., .5), 4 / 9)
+
     def test_attention_evaluation_reports_three_methods_and_reference_evidence(self):
         from safetensors.torch import save_file
         from script.bank_attention import CrossAttention
@@ -43,6 +49,7 @@ class RetrievalTests(unittest.TestCase):
             plan, fixture_args, bank, cache, output = self.fixture(root)
             args = parse_args(["--exper", "FB", "--gpus", "--stage", "all"])
             vars(args).update(vars(fixture_args), results_dir=str(root / "outputs"), export_previews=False, method="nearest")
+            args.encoder_tuning = dict(args.encoder_tuning, enabled=False)
             model = root / "model"
             model.mkdir()
             for name in ("model.safetensors", "config.json", "preprocessor_config.json"):

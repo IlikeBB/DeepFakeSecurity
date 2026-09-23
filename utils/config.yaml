@@ -88,8 +88,42 @@ bank_probe:
 # 當前實驗：bash run.sh stage1/stage2 --exper FB_01
 # 直接查詢 real patch bank；無分類器訓練，train_fake 保留切分但不使用。
 retrieval:
-  experiment: ATT_DEMO  # 使用者指定；Stage 1／Stage 2 共用
-  method: cross_attention  # nearest／topk／cross_attention；後者同時輸出三種方法比較
+  experiment: null  # LoRA 會產生全新表徵，請自行填入新名稱；Stage 1／Stage 2 共用
+  method: topk  # 以 real bank Top-K cosine 相似度判斷；cross_attention 僅保留作消融
+  encoder_tuning:
+    enabled: true  # 最後一個 DINOv3 block 的 Q/K/V 加 LoRA；原始模型保持凍結
+    rank: 8
+    alpha: 8.0
+    epochs: 20
+    patience: 5  # validation loss 連續 5 個 epoch 未改善即停止
+    minimum_delta: 0.00001
+    batch_size: 8
+    images_per_epoch: 512  # 每輪 family-disjoint training real 的抽樣上限
+    validation_images: 128
+    validation_fraction: 0.2
+    learning_rate: 0.00001
+    weight_decay: 0.0001
+    anchor_weight: 1.0  # 約束新表徵不要偏離原始 DINOv3
+    compression:
+      mild_quality: [65, 90]  # 類似 UMCL 較輕壓縮分支；JPEG quality 並不等同 H.264 CRF
+      severe_quality: [30, 55]  # 類似較重壓縮分支
+      mild_scale: 0.75  # 先縮小再還原，模擬解析度與編碼資訊損失
+      severe_scale: 0.5
+      affinity_weight: 0.1  # 對齊不同品質下 patch-to-patch 關係
+    local_anomaly:
+      quality: [10, 35]  # 僅在局部區域製造強 JPEG／縮放／色彩 discrepancy
+      scale: 0.35
+      minimum_fraction: 0.18
+      maximum_fraction: 0.35
+      mask_threshold: 0.25  # patch 中至少 25% 被修改才視為 pseudo anomaly
+      margin: 0.1  # 修改區域與原 real patch 的最小 cosine distance
+      weight: 0.5
+      background_weight: 1.0  # 未修改區域必須保持接近
+    fake_interval: 5  # 每 5 個 real batch 才加入一次 fake margin
+    fake_batch_size: 2
+    fake_weight: 0.0  # real-only feature bank 預設不使用真實 fake；大於 0 才啟用
+    fake_margin: 0.1
+    gradient_clip: 1.0
   attention:
     neighbors: 16  # 先檢索 Top-K real patches，再做注意力加權
     temperature: 0.07  # 不需訓練的 Top-K cosine softmax 基準
@@ -103,6 +137,9 @@ retrieval:
     learning_rate: 0.001
     weight_decay: 0.0001
     noise_std: 0.02  # 訓練 query 擾動，目標保留乾淨 DINO 特徵
+  ablation:
+    boundary_weight: 0.5  # 前景遮罩邊界 patch 的異常證據權重
+    max_per_family: 2  # 在既有 Top-16 內，每個來源家族最多保留 2 個候選
   export_previews: false  # 選用 PCA／JPG 預覽；關閉可省去視覺化與重讀 NPY 的時間
   bank_dir: /ssd8/chihyu/Project/DeepFakeSecurity/RAG/normal
   results_dir: /ssd8/chihyu/Project/DeepFakeSecurity/outputs/feature_bank
@@ -148,7 +185,7 @@ segment_face:
   batch_size: 4
   cpu_threads: 4  # run.sh 單任務設定；mission.sh 會依分配核心數覆寫
   labels: all  # real→normal，fake→anomaly；也可單獨選 real / fake
-  parts: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]  # null 表示全部資料分包
+  parts: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39]  # null 表示全部資料分包
   frames_per_video: 10  # 均勻抽樣，不足則全部使用；null 表示全部有效幀
   overwrite: false  # 已有 JPG 直接略過；調整裁切參數後可加 --overwrite 重做
   limit: null  # 每個類別的來源影片數量上限，分派程序前套用；null 表示全部

@@ -6,6 +6,7 @@ set -eo pipefail
 # bash run.sh stage1
 # bash run.sh stage2
 # bash run.sh all  # 依序完成兩階段
+# YAML encoder_tuning.enabled=true：先訓練 DINOv3 最後一層 LoRA，再重建整套表徵。
 # YAML method：nearest／topk／cross_attention；attention 訓練參數集中在 retrieval.attention。
 # cross_attention 的 Stage 2 同時比較三種評分方式；只用 real 訓練，patience 預設 5。
 # Stage 1 只用 real 建庫，Stage 2 查詢 bank 並評估，兩階段使用相同名稱。
@@ -19,20 +20,22 @@ stage="${1:-stage1}"
 case "$stage" in
   --help|-h)
     cat <<'HELP'
-使用方式：bash run.sh [stage1|stage2|all] [其他參數]
+使用方式：bash run.sh [stage1|stage2|ablation|all] [其他參數]
 先在 utils/config.yaml 的 retrieval.experiment 填入名稱；其他設定也從 YAML 讀取。
-  stage1  多 GPU 提取 real 特徵並建庫；cross_attention 模式再訓練 Q/K 投影
+  stage1  訓練 DINOv3 LoRA、多 GPU 重建 real 特徵並建庫；cross_attention 模式才訓練 attention
   stage2  提取保留組特徵，以 real 校準門檻，輸出測試指標及匹配明細
+  ablation  比較 Top-K、邊界降權、來源家族去重及兩者合併
   all     依序完成兩階段
 資源參數：--workers 16 --gpus 4 5 6 --batch-size 8
 預覽：retrieval.export_previews 設為 true 可輸出 PCA／JPG，預設 false。
+LoRA：retrieval.encoder_tuning.enabled=true 時使用第一張 GPU 訓練；其後特徵提取使用全部 GPU。
 命令列覆寫：--exper 名稱、--method nearest|topk|cross_attention，以及上述資源參數。
 特徵：RAG/normal/<名稱>/；結果：outputs/feature_bank/<名稱>/stage1、stage2
 設定：utils/config.yaml 的 retrieval；執行環境：pt230。
 HELP
     exit 0
     ;;
-  stage1|stage2|all) if (($#)); then shift; fi ;;
+  stage1|stage2|ablation|all) if (($#)); then shift; fi ;;
   probe-stage1|probe-stage2) stage="${stage#probe-}"; shift ;;
   --*) stage="stage1" ;;
   *) echo "未知階段：$stage，請使用 bash run.sh --help" >&2; exit 2 ;;

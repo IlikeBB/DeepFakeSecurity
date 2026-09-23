@@ -78,6 +78,23 @@ class ReferenceBank(PatchBank):
         return torch.cat(all_values), torch.cat(all_ids)
 
     @torch.inference_mode()
+    def score_candidates(self, query, candidate_ids, max_per_family):
+        """Reweight an existing Top-K list after limiting repeated source families."""
+        if self.families is None:
+            raise ValueError("Family IDs required for capped candidate scoring")
+        query = F.normalize(torch.as_tensor(query, dtype=torch.float32, device=self.bank.device), dim=-1)
+        ids = torch.as_tensor(candidate_ids, device=self.bank.device)
+        candidates = self.bank[ids]
+        similarities = (query[:, None] * candidates).sum(-1)
+        families = self.families[ids]
+        keep = torch.ones_like(similarities, dtype=torch.bool)
+        for position in range(1, ids.shape[1]):
+            keep[:, position] = (families[:, :position] == families[:, position, None]).sum(1) < max_per_family
+        weights = (similarities / self.config["temperature"]).masked_fill(~keep, -torch.inf).softmax(-1)
+        reconstructed = torch.einsum("bk,bkd->bd", weights, candidates)
+        return (1 - F.cosine_similarity(query, reconstructed)).clamp(0, 2).cpu().numpy(), keep.cpu().numpy()
+
+    @torch.inference_mode()
     def score(self, patches, top_fraction):
         if patches.ndim != 3 or patches.shape[0] != 1:
             raise ValueError("Reference scoring expects one image at a time")

@@ -3,22 +3,21 @@ set -eo pipefail
 
 task="${1:-crop-face}"
 case "$task" in
+  stage1|stage2|ablation|all) if (($#)); then shift; fi ;;
   crop-face|segment-face|patch-bank) if (($#)); then shift; fi ;;
   --help|-h)
     cat <<'HELP'
 Usage:
-  bash mission.sh segment-face [options]  # configurable CPU/GPU parallel jobs
-  bash mission.sh crop-face [options]     # original RetinaFace worker pool
-  bash mission.sh patch-bank [options]    # feature extraction, adapter training and evaluation
+  bash mission.sh stage1 [options]   # train LoRA and build the real feature bank
+  bash mission.sh stage2 [options]   # calibrate and evaluate with the Stage 1 bank
+  bash mission.sh ablation [options] # compare retrieval scoring variants
+  bash mission.sh all [options]      # run Stage 1 followed by Stage 2
+  bash mission.sh segment-face [options] # parallel SegFace preprocessing
+  bash mission.sh crop-face [options]    # RetinaFace video preprocessing
 
-Segmentation defaults: parts 0-10, up to 10 frames/video, JPG only.
-Resources: --cores 8 --gpus 1,2 (two GPUs), or --gpus none --cpu-workers 4.
-Use --dry-run to inspect allocation without processing images.
-GPU assignments and data paths: utils/config.yaml.
-patch-bank uses --device cuda:1 (one GPU), not segmentation's --cores/--gpus options.
-Example: bash mission.sh segment-face --limit 1
---limit applies per class before distributing videos across workers.
---parts and --frames-per-video override YAML.
+Set retrieval.experiment and resources in utils/config.yaml first.
+Example: bash mission.sh stage1 --gpus 4 5 6 --workers 16 --batch-size 8
+The legacy patch-bank Python module is absent in this revision.
 HELP
     exit 0 ;;
   --*) task=crop-face ;;  # Preserve original mission.sh --workers ... usage.
@@ -26,6 +25,21 @@ HELP
 esac
 
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
+
+if [[ "$task" =~ ^(stage1|stage2|ablation|all)$ ]]; then
+  exec bash run.sh "$task" "$@"
+fi
+
+case "$task" in
+  crop-face) missing="script/crop_face.py" ;;
+  segment-face) missing="script/mission.py" ;;
+  patch-bank) missing="script/feature_bank.py" ;;
+esac
+if [[ ! -f "$missing" ]]; then
+  echo "任務 '$task' 目前不可用：缺少 $missing；目前表徵實驗請使用 bash mission.sh stage1|stage2|all。" >&2
+  exit 2
+fi
+
 conda_base="$(conda info --base)"
 source "$conda_base/etc/profile.d/conda.sh"
 conda activate pt230

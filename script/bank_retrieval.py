@@ -25,6 +25,19 @@ def foreground_patches(features, image_path, minimum):
     return features.reshape(-1, features.shape[-1])[ids], ids, (h, w)
 
 
+def aggregate_patch_score(distances, ids, grid, fraction, boundary_weight=1.):
+    """Average the largest weighted patch errors; boundary is the foreground-mask edge."""
+    mask = np.zeros(grid, dtype=bool)
+    mask.reshape(-1)[ids] = True
+    padded = np.pad(mask, 1, constant_values=False)
+    interior = (mask & padded[:-2, 1:-1] & padded[2:, 1:-1]
+                & padded[1:-1, :-2] & padded[1:-1, 2:])
+    weights = np.where(interior.reshape(-1)[ids], 1., boundary_weight)
+    evidence = np.asarray(distances) * weights
+    count = max(1, math.ceil(len(evidence) * fraction))
+    return float(np.sort(evidence)[-count:].mean())
+
+
 def build(plan, args, bank, output):
     stage1 = output / "stage1"
     stage1.mkdir(parents=True, exist_ok=True)
@@ -200,3 +213,77 @@ def evaluate(plan, args, bank, cache, output):
     print(f"Stage 2 完成：AUROC={result['auroc']:.4f} AP={result['average_precision']:.4f} "
           f"FPR={result['false_positive_rate']:.4f} TPR={result['true_positive_rate']:.4f}\n"
           f"完整結果：{stage2 / 'metrics.json'}", flush=True)
+
+
+def evaluate_ablation(plan, args, bank, cache, output):
+    """Compare boundary weighting and source-family-diverse Top-K on the same queries."""
+    info, sources, arrays = load_index(plan, bank, output)
+    calibration = image_records(plan["groups"]["calibration"], "calibration")
+    evaluation = image_records(plan["groups"]["evaluation"], "evaluation")
+    if not calibration or any(row["label"] for row in calibration):
+        raise ValueError("Calibration must contain only independent real images")
+    rows = calibration + evaluation
+    ablation = args.ablation
+    family_names = {name: i for i, name in enumerate(sorted({row["group_id"] for row in sources}))}
+    source_families = np.array([family_names[row["group_id"]] for row in sources])
+    patch_families = source_families[np.asarray(arrays["origins"])]
+    devices = args.devices or ["cpu"]
+    shards = [rows[i::len(devices)] for i in range(len(devices))]
+    with ThreadPoolExecutor(max_workers=args.workers) as pool, tqdm(
+            total=len(rows), desc="邊界／家族多樣性消融", unit="image", dynamic_ncols=True, mininterval=.5) as progress:
+        def worker(shard, device):
+            from script.bank_attention import ReferenceBank
+            reference = ReferenceBank(arrays["features"], device, args.query_chunk_size,
+                                      args.bank_chunk_size, args.attention, families=patch_families)
+            result = []
+            def read(row):
+                return load_sample(cache / row["role"], row)[1]
+            for start in range(0, len(shard), 32):
+                batch = shard[start:start + 32]
+                for row, features in zip(batch, pool.map(read, batch)):
+                    selected, ids, grid = foreground_patches(features, row["image_path"], info["foreground_minimum"])
+                    match_path = output / "stage2" / row["role"] / "patch_matches" / f"{row['sample_id']:08d}.npz"
+                    with np.load(match_path, allow_pickle=False) as matched:
+                        if not {"candidate_ids", "query_patch_ids", "topk_distances"} <= set(matched.files):
+                            raise ValueError(f"Stage 2 Top-K evidence missing: {match_path}")
+                        if not np.array_equal(ids, matched["query_patch_ids"]):
+                            raise ValueError(f"Stage 2 query patches changed: {match_path}")
+                        candidate_ids = matched["candidate_ids"]
+                        base_distance = matched["topk_distances"]
+                    diverse_distance, keep = reference.score_candidates(
+                        selected, candidate_ids, ablation["max_per_family"])
+                    scores = {
+                        "topk": aggregate_patch_score(base_distance, ids, grid, info["top_fraction"]),
+                        "topk_boundary": aggregate_patch_score(base_distance, ids, grid, info["top_fraction"],
+                                                               ablation["boundary_weight"]),
+                        "family_cap_topk": aggregate_patch_score(diverse_distance, ids, grid, info["top_fraction"]),
+                        "family_cap_topk_boundary": aggregate_patch_score(
+                            diverse_distance, ids, grid, info["top_fraction"], ablation["boundary_weight"]),
+                    }
+                    result.append({key: row[key] for key in ("sample_id", "role", "video_id", "group_id", "label")} |
+                                  {"scores": scores, "mean_kept_candidates": float(keep.sum(1).mean())})
+                with progress.get_lock():
+                    progress.update(len(batch))
+            return result
+        results = [row for shard in map_devices(worker, shards, devices) for row in shard]
+    calibrated = [row for row in results if row["role"] == "calibration"]
+    tested = [row for row in results if row["role"] == "evaluation"]
+    methods, thresholds = {}, {}
+    for name in tested[0]["scores"]:
+        threshold = float(np.quantile([row["scores"][name] for row in calibrated], args.threshold_quantile))
+        thresholds[name] = threshold
+        methods[name] = metrics([dict(row, score=row["scores"][name]) for row in tested], threshold)
+    kept = np.array([row["mean_kept_candidates"] for row in results])
+    directory = output / "ablations/boundary_family"
+    write_json(directory / "scores.json", results)
+    write_json(directory / "report.json", {
+        "protocol": "Fixed one-shot development ablation on the existing evaluation split; not final test",
+        "settings": dict(ablation, candidate_scope=f"existing_top_{args.attention['neighbors']}"),
+        "methods": methods, "thresholds": thresholds,
+        "kept_candidates_per_patch": {"mean": float(kept.mean()), "minimum_image_mean": float(kept.min()),
+                                      "maximum_image_mean": float(kept.max())},
+        "retrieval_sha256": sha256(output / "stage1/retrieval.json"),
+        "source_count": len(sources), "bank_patches": int(len(arrays["features"])),
+    })
+    print("消融完成：" + " ".join(f"{name}={value['auroc']:.4f}" for name, value in methods.items())
+          + f"\n完整結果：{directory / 'report.json'}", flush=True)

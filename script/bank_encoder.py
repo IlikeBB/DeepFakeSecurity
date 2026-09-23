@@ -14,6 +14,12 @@ def load_encoder(args):
     processor = AutoImageProcessor.from_pretrained(args.model_path, local_files_only=True)
     model = AutoModel.from_pretrained(args.model_path, local_files_only=True).to(args.device).eval()
     model.requires_grad_(False)
+    checkpoint = getattr(args, "encoder_checkpoint", None)
+    if checkpoint:
+        from script.dino_lora import load_lora
+
+        load_lora(model, checkpoint, args.encoder_tuning, args.device)
+        model.eval()
     return model, processor
 
 
