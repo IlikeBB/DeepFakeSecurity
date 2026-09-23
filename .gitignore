@@ -1,6 +1,12 @@
 
 *.safetensors
+models/clip-vit-base-patch16/
 models/token_list
+models/segface/swinb_celeba_512/
 __pycache__/
 *.pyc
 .env
+outputs/
+RAG/general/*/
+RAG/normal/*/
+RAG/cache/*/

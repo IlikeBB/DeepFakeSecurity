@@ -8,63 +8,8 @@ device: cpu  # GPU 範例：cuda:0
 num_frames: 32
 batch_size: 8
 split: all  # all / train / test
-limit: null  # null 表示不限制影片數量；測試時可設為 1
+limit: null  # null 表示不限制影片數量；需要少量執行時可設為 1
 overwrite: false
-
-# bash run.sh：逐張提取 real 人臉，儲存 NPY，每個來源資料夾附一張 JPG 預覽。
-feature_bank:
-  output_dir: RAG/normal
-  stage: build  # 只建 real bank；不執行校準、評估或影片聚合
-  storage_format: npy
-  experiment: dfdc_real_bank_v2
-  pca_images: 32  # 用 bank real 圖片建立共用 PCA 轉色規則
-  visualization_size: 224  # 僅舊 visualize 模式使用；build 預覽依裁切人臉比例繪製
-  jpeg_quality: 95
-  results_dir: outputs/feature_bank
-  faces_dir: /ssd8/chihyu/Dataset/DeepFake_Dataset/DFDC-Frame
-  source_root: /ssd2/DeepFakes/deepFakeChallenge
-  label_csv: /ssd2/DeepFakes/DFDC_list/test.csv
-  device: auto  # auto 使用 cuda:0（若可用），可由 --device cuda:6 覆寫
-  seed: 42
-  bank_videos: 50  # 最多讀取的 real 來源資料夾數；每張人臉獨立提取
-  # 以下三個分組數僅舊 all/evaluate 流程使用；build 不建立校準或評估分組。
-  calibration_videos: 20
-  eval_real_videos: 20
-  eval_fake_videos: 20
-  max_frames: 32
-  batch_size: 8
-  dtype: float16  # 存檔精度；提取與距離計算用 float32
-  top_fraction: 0.1  # 圖片分數：最高 10% patch 距離的平均
-  threshold_quantile: 0.99  # 僅使用 calibration real 校準
-  query_chunk_size: 1024
-  bank_chunk_size: 16384
-
-# bash run.sh --task patch-bank：繼承 feature_bank，以下為小規模基準實驗覆寫值。
-patch_bank:
-  input_layout: flat
-  stage: all
-  experiment: dfdc_patch_adapter_v1
-  normal_dir: /ssd8/chihyu/Dataset/DeepFake_Dataset/DFDC-Frame-CropFace_normal
-  anomaly_dir: /ssd8/chihyu/Dataset/DeepFake_Dataset/DFDC-Frame-CropFace_anomaly
-  bank_videos: 8
-  calibration_videos: 4
-  eval_real_videos: 4
-  eval_fake_videos: 4
-  max_frames: 10
-  device: cuda:1
-  batch_size: 8
-  train_adapter: true  # DINOv3 凍結，只訓練局部特徵 residual adapter
-  train_fake_videos: 2  # 訓練專用 fake；0 表示 real-only 訓練，測試 fake 仍獨立保留
-  train_epochs: 5
-  train_batch_size: 8
-  adapter_hidden: 128
-  learning_rate: 0.0001
-  reference_patches: 2048  # 訓練用 real patch 子集；推論仍使用完整 real bank
-  anchor_weight: 1.0  # 保留原始 DINOv3 特徵方向，降低表徵塌縮風險
-  fake_interval: 5  # 每 5 個 real 步驟插入一小批 fake，跨 epoch 累計
-  fake_batch_size: 2
-  fake_weight: 0.1
-  fake_margin: 0.1  # 希望 fake 的圖片分數高於本批 real 分數的幅度
 
 # AUC 改善實驗：自動建立／沿用原始 DINO NPY，不沿用看過全部 training 的 adapter。
 # real 統計建模＋少量 fake 輔助線性評分；這是弱監督，不是純 real-only。
@@ -158,39 +103,39 @@ retrieval:
   pca_images: 32
   jpeg_quality: 95
 
-# mission.sh 的總資源預算；GPU 模式每張卡一個程序，影片平均分配。
+# SegFace 多 GPU 執行資源；每張 GPU 一個程序，CPU 核心平均分配。
 mission:
-  cpu_cores: 8  # 總邏輯 CPU 核心數，以 CPU affinity 限制，再平均分配給程序
-  gpu_ids: [1, 2]  # 清單長度就是 GPU 數量；[] 表示只用 CPU
-  cpu_workers: 4  # 只用 CPU 時的程序數，上限為 cpu_cores 與影片數
+  cpu_cores: 8
+  gpu_ids: [1, 2]
+  cpu_workers: 4
 
-# bash mission.sh segment-face：擴張分割遮罩後裁切，輸出扁平檔名。
+# 對 RetinaFace 輸出做語意臉部分割、遮罩擴張與去背景裁切。
 segment_face:
-  input_dir: /ssd8/chihyu/Dataset/DeepFake_Dataset/DFDC-Frame
-  normal_output_dir: /ssd8/chihyu/Dataset/DeepFake_Dataset/DFDC-Frame-CropFace_normal
-  anomaly_output_dir: /ssd8/chihyu/Dataset/DeepFake_Dataset/DFDC-Frame-CropFace_anomaly
-  parser_model: SegFace-SwinB-CelebAMaskHQ-512  # AAAI 2025，作者官方權重
+  input_dir: /ssd8/chihyu/Dataset/DeepFake_Dataset/DFDC
+  normal_output_dir: /ssd8/chihyu/Dataset/DeepFake_Dataset/DFDC-SegFace-normal
+  anomaly_output_dir: /ssd8/chihyu/Dataset/DeepFake_Dataset/DFDC-SegFace-anomaly
+  parser_model: SegFace-SwinB-CelebAMaskHQ-512
   parser_revision: 5e093b03c0523f7f32a9845bbbc75ecb027c8bee
   model_dir: models/segface
-  checkpoint: swinb_celeba_512/model.safetensors  # 官方 checkpoint 轉成純權重，避免依賴訓練物件
-  face_ids: [2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15]  # SegFace 類別：皮膚、耳朵、眉眼鼻嘴、眼鏡
-  background_ids: [0, 1, 3, 14, 16, 17, 18]  # 背景、脖子、衣服、頭髮、帽子、飾品
+  checkpoint: swinb_celeba_512/model.safetensors
+  face_ids: [2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15]
+  background_ids: [0, 1, 3, 14, 16, 17, 18]
   pixel_confidence: 0.5
-  dilation_ratio: 0.05  # 向外擴張半徑 = ceil(輸入較短邊 × 此比例)，224 像素時為 12
-  closing_ratio: 0.01  # 閉運算補小裂縫，再填滿遮罩內部孔洞
-  min_face_area: 0.02  # 擴張前人臉至少占輸入 2%，否則記錄 no_face
-  background: black  # black：遮罩外設黑色；keep：只裁外接框、保留框內背景
+  dilation_ratio: 0.05
+  closing_ratio: 0.01
+  min_face_area: 0.02
+  background: black
   jpeg_quality: 95
   device: auto
   batch_size: 4
-  cpu_threads: 4  # run.sh 單任務設定；mission.sh 會依分配核心數覆寫
-  labels: all  # real→normal，fake→anomaly；也可單獨選 real / fake
-  parts: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39]  # null 表示全部資料分包
-  frames_per_video: 10  # 均勻抽樣，不足則全部使用；null 表示全部有效幀
-  overwrite: false  # 已有 JPG 直接略過；調整裁切參數後可加 --overwrite 重做
-  limit: null  # 每個類別的來源影片數量上限，分派程序前套用；null 表示全部
+  cpu_threads: 4
+  labels: all
+  parts: null  # null 表示處理所有目前存在的 DFDC 分包
+  frames_per_video: null  # null 表示處理每支影片的全部有效 RetinaFace 圖片
+  overwrite: false
+  limit: null
 
-# RetinaFace 切臉任務（bash mission.sh）。共用上方 data_root、num_frames、split、limit、overwrite。
+# RetinaFace 切臉任務（bash mission.sh crop-face）。
 crop_face:
   data_root: /ssd2/DeepFakes/deepFakeChallenge
   label_csv: /ssd2/DeepFakes/DFDC_list/test.csv  # null 時使用 Celeb-DF 官方切分
@@ -198,9 +143,11 @@ crop_face:
   output_dir: /ssd8/chihyu/Dataset/DeepFake_Dataset/DFDC
   cache_dir: outputs/retinaface_cache  # 首次執行自動下載 RetinaFace 權重
   device: cpu  # cpu 或 cuda:0；多個工作會共用指定的 GPU
-  workers: 8  # 平行工作程序數，每個程序載入一份模型
+  gpu_ids: [5]  # 目前預設使用 GPU 5；執行前可依當下負載調整
+  workers: 8  # CPU／單 GPU 的程序數；gpu_ids 非空時固定每張 GPU 一個程序
   cpu_threads: 2  # 每個程序的 CPU 推論執行緒數
   threshold: 0.9
   margin: 0.2  # 裁切框每側增加人臉寬／高的 20%
   image_size: 224
   detection_size: 640  # 偵測輸入最長邊上限；裁切仍取自原始畫面
+  detection_batch_size: 2  # 每次送入 RetinaFace 的幀數；共享 GPU 顯存不足時改為 1

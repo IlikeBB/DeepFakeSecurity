@@ -8,3 +8,4 @@ Pillow
 opencv-python
 scipy
 PyYAML
+tqdm>=4.66

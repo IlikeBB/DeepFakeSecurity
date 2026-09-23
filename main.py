@@ -17,10 +17,8 @@ def parse_args(argv=None):
     with (root / "utils/config.yaml").open(encoding="utf-8") as file:
         config = yaml.safe_load(file)
     config.pop("crop_face", None)
-    config.pop("feature_bank", None)
     config.pop("segment_face", None)
     config.pop("mission", None)
-    config.pop("patch_bank", None)
     config.pop("bank_probe", None)
     config.pop("retrieval", None)
     parser = argparse.ArgumentParser(description="Extract DINOv3 features from Celeb-DF videos.")
@@ -65,7 +63,8 @@ if __name__ == "__main__":
     os.environ["USE_TF"] = "0"
     os.environ["USE_TORCH"] = "1"
     selector = argparse.ArgumentParser(add_help=False)
-    selector.add_argument("--task", choices=("bank-retrieval", "feature-bank", "patch-bank", "bank-probe", "segment-face", "extract"), default="bank-retrieval")
+    selector.add_argument("--task", choices=("bank-retrieval", "bank-probe", "segment-face", "extract"),
+                          default="bank-retrieval")
     task, remaining = selector.parse_known_args()
     if task.task == "bank-retrieval":
         from script.retrieval import main
@@ -79,10 +78,6 @@ if __name__ == "__main__":
         from script.segment_face import main
 
         main(remaining)
-    elif task.task in ("feature-bank", "patch-bank"):
-        from script.feature_bank import main
-
-        main(remaining, profile="patch_bank" if task.task == "patch-bank" else "feature_bank")
     else:
         args = parse_args(remaining)
         from script.extract import extract

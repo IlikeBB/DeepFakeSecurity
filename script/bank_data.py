@@ -69,6 +69,35 @@ def select_groups(candidates, config):
     return groups
 
 
+def select_full_groups(candidates, seed):
+    """Use every cropped video while keeping source families disjoint."""
+    families = {}
+    for video in sorted(candidates, key=lambda row: row["video_id"]):
+        families.setdefault(video["group_id"], []).append(video)
+    real_families = sorted(key for key, values in families.items() if any(v["label"] == 0 for v in values))
+    real_only = [key for key in real_families if all(v["label"] == 0 for v in families[key])]
+    fake_only = sorted(set(families) - set(real_families))
+    rng = random.Random(seed)
+    rng.shuffle(real_only)
+    calibration_count = max(1, int(len(real_families) * .15))
+    bank_count = int(len(real_families) * .70)
+    if len(real_only) < calibration_count or bank_count < 2 or bank_count + calibration_count >= len(real_families):
+        raise ValueError("Full-data split needs enough real-only families for calibration and evaluation")
+    calibration = set(real_only[:calibration_count])
+    remaining = sorted(set(real_families) - calibration)
+    rng.shuffle(remaining)
+    training = set(remaining[:bank_count])
+    rng.shuffle(fake_only)
+    training.update(fake_only[:int(len(fake_only) * .70)])
+    groups = {"bank": [], "train_fake": [], "calibration": [], "evaluation": []}
+    for key, values in families.items():
+        for video in values:
+            role = ("calibration" if key in calibration else
+                    ("bank" if video["label"] == 0 else "train_fake") if key in training else "evaluation")
+            groups[role].append(video)
+    return groups
+
+
 def prepare_plan(config, bank_only=False):
     faces_root = Path(config["faces_dir"])
     source_root = Path(config["source_root"])
@@ -107,7 +136,8 @@ def prepare_plan(config, bank_only=False):
         if not frames:
             no_faces += 1
             continue
-        indices = np.linspace(0, len(frames) - 1, min(config["max_frames"], len(frames)), dtype=int)
+        count = len(frames) if config.get("full_data", False) else min(config["max_frames"], len(frames))
+        indices = np.linspace(0, len(frames) - 1, count, dtype=int)
         selected = []
         for i in indices:
             frame = frames[i]
@@ -123,6 +153,8 @@ def prepare_plan(config, bank_only=False):
         if not candidates:
             raise ValueError("No real face images found")
         groups = {"bank": candidates[:config["bank_videos"]]}
+    elif config.get("full_data", False):
+        groups = select_full_groups(candidates, config["seed"])
     else:
         groups = select_groups(candidates, config)
     # Only stat selected images, rather than every frame in the full dataset.
@@ -131,8 +163,11 @@ def prepare_plan(config, bank_only=False):
             for frame in video["frames"]:
                 stat = Path(frame["image_path"]).stat()
                 frame.update(size=stat.st_size, mtime_ns=stat.st_mtime_ns)
-    return {"protocol": ("Real-only independent image bank; no calibration or evaluation" if bank_only else
-                         "DFDC test-list pilot; source-family-disjoint internal splits, not official test results"),
+    protocol = ("Real-only independent image bank; no calibration or evaluation" if bank_only else
+                "All RetinaFace-cropped DFDC images; source-family-disjoint internal splits, "
+                "not identity-disjoint or official test results" if config.get("full_data", False) else
+                "DFDC test-list pilot; source-family-disjoint internal splits, not official test results")
+    return {"protocol": protocol,
             "audit": {"csv_videos": len(labels), "missing_manifests": len(labels.keys() - found),
                       "zero_face_videos": no_faces, "eligible_videos": len(candidates)},
             "groups": groups}

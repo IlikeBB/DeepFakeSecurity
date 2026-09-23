@@ -10,6 +10,7 @@ import numpy as np
 import cv2
 from PIL import Image
 import torch
+from tqdm.auto import tqdm
 import yaml
 
 from script.bank_data import read_json
@@ -30,6 +31,7 @@ def parse_args(argv=None):
     parser.add_argument("--parts", nargs="+", type=int)
     parser.add_argument("--manifest-list", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--lock-fds", nargs="+", type=int, default=[], help=argparse.SUPPRESS)
+    parser.add_argument("--progress-position", type=int, default=0, help=argparse.SUPPRESS)
     parser.set_defaults(**defaults)
     args = parser.parse_args(argv)
     for name in ("input_dir", "normal_output_dir", "anomaly_output_dir", "model_dir"):
@@ -50,6 +52,8 @@ def parse_args(argv=None):
         parser.error(f"Input directory does not exist: {source}")
     if args.batch_size < 1 or args.cpu_threads < 1 or (args.limit is not None and args.limit < 1):
         parser.error("batch_size, cpu_threads and limit must be positive")
+    if args.progress_position < 0:
+        parser.error("progress_position must be nonnegative")
     if args.frames_per_video is not None and args.frames_per_video < 1:
         parser.error("frames_per_video must be positive or null")
     if args.parts is not None and (not args.parts or any(type(i) is not int or i < 0 for i in args.parts)):
@@ -201,19 +205,24 @@ def main(argv=None):
             return parser(images)
 
         totals = {"videos": 0, "saved": 0, "no_face": 0, "skipped_videos": 0}
-        for manifest in manifests:
-            data = read_json(manifest)
-            if data["label"] not in (0, 1):
-                raise ValueError(f"Invalid real/fake label: {manifest}")
-            if args.labels != "all" and data["label"] != (0 if args.labels == "real" else 1):
-                continue
-            args.output_dir = str(outputs[data["label"]])
-            result = segment_video(manifest, data, args, detect)
-            totals["videos"] += 1
-            for key in ("saved", "no_face"):
-                totals[key] += result[key]
-            totals["skipped_videos"] += int(result["skipped"])
-            print(f"[{totals['videos']}] label={data['label']} {manifest.parent.name}: {result}", flush=True)
+        with tqdm(total=len(manifests), desc=f"SegFace {args.device}", unit="video",
+                  position=args.progress_position, dynamic_ncols=True, mininterval=.5) as progress:
+            for manifest in manifests:
+                data = read_json(manifest)
+                if data["label"] not in (0, 1):
+                    raise ValueError(f"Invalid real/fake label: {manifest}")
+                if args.labels != "all" and data["label"] != (0 if args.labels == "real" else 1):
+                    progress.update()
+                    continue
+                args.output_dir = str(outputs[data["label"]])
+                result = segment_video(manifest, data, args, detect)
+                totals["videos"] += 1
+                for key in ("saved", "no_face"):
+                    totals[key] += result[key]
+                totals["skipped_videos"] += int(result["skipped"])
+                progress.update()
+                progress.set_postfix(saved=totals["saved"], no_face=totals["no_face"],
+                                     skipped=totals["skipped_videos"], refresh=False)
         if not totals["videos"]:
             raise ValueError("No matching input metadata found")
         print(f"Segmentation complete: {totals}; outputs={outputs}", flush=True)

@@ -92,7 +92,8 @@ def main(argv=None):
         parser.print_help()
         print("\nSegmentation options: --parts 0 1 ... --frames-per-video 10 --limit 1 --labels all|real|fake")
         return
-    if any(option.split("=")[0] in ("--device", "--cpu-threads", "--manifest-list", "--lock-fds") for option in remaining):
+    if any(option.split("=")[0] in ("--device", "--cpu-threads", "--manifest-list", "--lock-fds", "--progress-position")
+           for option in remaining):
         parser.error("Mission owns device/thread/job allocation; use --cores and --gpus")
     available = sorted(os.sched_getaffinity(0))
     if type(resources.cores) is not int or not 1 <= resources.cores <= len(available):
@@ -135,7 +136,8 @@ def main(argv=None):
             job_file.write_text(json.dumps([str(path) for path in partition]))
             commands.append(["taskset", "-c", ",".join(map(str, cpus)), sys.executable, "-u", str(project / "main.py"),
                              "--task", "segment-face", *remaining, "--device", device, "--cpu-threads", str(len(cpus)),
-                             "--manifest-list", str(job_file), "--lock-fds", *map(str, locks)])
+                             "--manifest-list", str(job_file), "--progress-position", str(i),
+                             "--lock-fds", *map(str, locks)])
             environment = os.environ.copy()
             for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
                 environment[key] = str(len(cpus))

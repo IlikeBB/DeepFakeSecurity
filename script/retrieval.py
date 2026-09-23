@@ -8,8 +8,7 @@ import torch
 from threadpoolctl import threadpool_limits
 import yaml
 
-from script.bank_data import read_json, sha256, write_json
-from script.bank_flat import prepare_flat_plan
+from script.bank_data import prepare_plan, read_json, sha256, write_json
 from script.bank_retrieval import build, evaluate, load_index
 from script.retrieval_io import ensure_experiment_config, experiment_lock, extract_roles
 
@@ -18,8 +17,9 @@ def parse_args(argv=None):
     root = Path(__file__).resolve().parents[1]
     config = yaml.safe_load((root / "utils/config.yaml").read_text(encoding="utf-8"))
     defaults = dict(config["retrieval"], model_path=config["model_path"],
-                    normal_dir=config["patch_bank"]["normal_dir"], anomaly_dir=config["patch_bank"]["anomaly_dir"],
-                    source_root=config["feature_bank"]["source_root"], label_csv=config["feature_bank"]["label_csv"])
+                    faces_dir=config["crop_face"]["output_dir"],
+                    source_root=config["crop_face"]["data_root"],
+                    label_csv=config["crop_face"]["label_csv"])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stage", choices=("prepare", "stage1", "stage2", "ablation", "all"), default="stage1")
     parser.add_argument("--exper", "--experiment", dest="experiment")
@@ -46,10 +46,10 @@ def parse_args(argv=None):
             or any(gpu < 0 or gpu >= torch.cuda.device_count() for gpu in args.gpu_ids)):
         parser.error("--gpus 請指定可用且不重複的 GPU 編號；空的 --gpus 使用 CPU")
     args.devices = [f"cuda:{gpu}" for gpu in args.gpu_ids]
-    for key in ("bank_dir", "results_dir", "model_path", "normal_dir", "anomaly_dir", "source_root", "label_csv"):
+    for key in ("bank_dir", "results_dir", "model_path", "faces_dir", "source_root", "label_csv"):
         setattr(args, key, str((root / Path(getattr(args, key)).expanduser()).resolve()))
     for destination in (Path(args.bank_dir), Path(args.results_dir)):
-        for name in ("normal_dir", "anomaly_dir", "source_root"):
+        for name in ("faces_dir", "source_root"):
             source = Path(getattr(args, name))
             if destination == source or source in destination.parents:
                 parser.error("輸出不能放入來源資料集")
@@ -129,7 +129,7 @@ def main(argv=None):
         if plan_file.exists():
             plan = read_json(plan_file)
         elif args.stage in ("prepare", "stage1", "all"):
-            plan = prepare_flat_plan(dict(vars(args), full_data=True))
+            plan = prepare_plan(dict(vars(args), full_data=True))
             write_json(plan_file, plan)
         else:
             raise ValueError("請先完成 Stage 1，來源切分不存在")
@@ -137,8 +137,10 @@ def main(argv=None):
                        for roles in (("bank", "train_fake"), ("calibration",), ("evaluation",))]
         if any(family_sets[i] & family_sets[j] for i in range(3) for j in range(i)):
             raise ValueError("Source families overlap between training, calibration and evaluation")
-        print(f"Bank: {bank}\nOutput: {output}\nGPUs: {args.devices or ['cpu']}; workers={args.workers}", flush=True)
-        print({role: sum(len(v["frames"]) for v in values) for role, values in plan["groups"].items()}, flush=True)
+        counts = {role: sum(len(video["frames"]) for video in videos)
+                  for role, videos in plan["groups"].items()}
+        print(f"Experiment={args.experiment}; devices={args.devices or ['cpu']}; "
+              f"workers={args.workers}; frames={counts}", flush=True)
         if args.stage in ("prepare", "stage1", "all"):
             write_json(output / "stage1/config.json", spec)
             write_json(output / "stage1/splits.json", plan)
