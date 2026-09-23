@@ -1,215 +1,186 @@
 # DeepFakeSecurity
 
-本專案處理 DFDC 影片，提供 RetinaFace 人臉裁切、SegFace 語意切割，以及 DINOv3 real feature bank 的建立、校準與評估。所有入口都會自動啟用 Conda 環境 `pt230`。
+本專案將 DFDC 影片轉成人臉資料，建立 DINOv3 real patch feature bank，再以獨立的 real calibration 與 real/fake evaluation 資料進行異常偵測。所有入口都會自動啟用 Conda 環境 `pt230`。
 
-## 完整資料流
-
-```mermaid
-flowchart LR
-    A["DFDC 原始影片<br/>MP4 + test.csv"] --> B["RetinaFace<br/>crop-face"]
-    B --> C["人臉 JPG + metadata.json<br/>依 part / video 保存"]
-    C --> D{"下一步"}
-    D -->|--face-source retinaface| E["Stage 1<br/>real feature bank"]
-    D -->|純臉去背景資料| F["SegFace<br/>segment-face"]
-    F --> G["real / fake 分開保存<br/>黑色背景 JPG"]
-    G -->|--face-source segface| E
-    E --> H["Stage 2<br/>校準 + 評估"]
-    H --> I["分數、門檻、指標<br/>patch 匹配證據"]
-    H --> J["Ablation<br/>邊界與來源家族限制"]
-```
-
-`--face-source retinaface|segface` 決定 Stage 1 使用原始人臉框或 SegFace 純臉 JPG；兩者都沿用 RetinaFace 的 `metadata.json` 做來源 family 切分。
-
-## 快速開始
+## 1. 快速開始
 
 ```bash
 cd /ssd8/chihyu/Project/DeepFakeSecurity
 
-# 1. RetinaFace：5 張 GPU 裁切 DFDC，每支影片抽 32 幀
+# Step 1：RetinaFace 裁切人臉
 bash mission.sh crop-face \
   --num-frames 32 \
   --gpus 0,1,2,3,4
 
-# 2. SegFace：5 張 GPU，每張卡一個 worker，batch size 8
+# Step 2：SegFace 保留純人臉並移除背景
 bash mission.sh segment-face \
   --cores 5 \
   --gpus 0,1,2,3,4 \
   --batch-size 8
 
-# 3. 第一個研究基準：SegFace + frozen DINOv3 + 1-NN
-bash mission.sh stage1 --exper SEGFACE_FROZEN_NN_V1 \
-  --face-source segface --no-tune-encoder --method nearest \
-  --gpus 0 1 2 3 4 --batch-size 8
-bash mission.sh stage2 --exper SEGFACE_FROZEN_NN_V1 \
-  --face-source segface --no-tune-encoder --method nearest \
-  --gpus 0 1 2 3 4 --batch-size 8
+# Step 3：frozen DINOv3 提取 real patch features 並建立 1-NN bank
+bash mission.sh stage1 \
+  --exper SEGFACE_FROZEN_NN_V1 \
+  --face-source segface \
+  --no-tune-encoder \
+  --method nearest \
+  --gpus 0 1 2 3 4 \
+  --batch-size 8 \
+  --workers 16
 
-# 4. 完成 nearest baseline 後，再另建 topk 實驗與消融
-# bash mission.sh ablation --exper <已完成的 TOPK 實驗> --method topk ...
+# Step 4：以 real calibration 設定門檻，再評估保留的 real/fake
+bash mission.sh stage2 \
+  --exper SEGFACE_FROZEN_NN_V1 \
+  --face-source segface \
+  --no-tune-encoder \
+  --method nearest \
+  --gpus 0 1 2 3 4 \
+  --batch-size 8 \
+  --workers 16
 ```
 
-GPU 參數有兩種格式：
+GPU 參數格式依入口不同：
 
-| 任務 | 格式 | 範例 |
+| 任務 | GPU 格式 | 範例 |
 | --- | --- | --- |
 | `crop-face`、`segment-face` | 逗號分隔 | `--gpus 0,1,2,3,4` |
 | `stage1`、`stage2`、`ablation` | 空白分隔 | `--gpus 0 1 2 3 4` |
 
-## 前處理流程
+只建立並檢查資料切分、不提取特徵：
 
-```mermaid
-flowchart TD
-    subgraph RF["RetinaFace：crop-face"]
-        R1["讀取 test.csv 與影片路徑"] --> R2["影片只順序解碼一次"]
-        R2 --> R3["均勻選出 num_frames 幀"]
-        R3 --> R4["縮小偵測影像<br/>保留原始畫面"]
-        R4 --> R5["detection_batch_size<br/>批次 RetinaFace 推論"]
-        R5 --> R6{"偵測到人臉？"}
-        R6 -->|是| R7["選最大人臉<br/>加入 margin"]
-        R7 --> R8["由原始畫面裁切<br/>縮放為 224 × 224"]
-        R6 -->|否| R9["metadata 標記 no_face"]
-        R8 --> R10["寫入暫存目錄"]
-        R9 --> R10
-        R10 --> R11["完整後原子替換<br/>JPG + metadata.json"]
-    end
-
-    subgraph SF["SegFace：segment-face"]
-        S1["讀取 metadata 中 status=ok 的 JPG"] --> S2["影片平均分配至各 GPU worker"]
-        S2 --> S3["Swin-B 批次產生語意遮罩"]
-        S3 --> S4["保留皮膚、耳朵、五官與眼鏡"]
-        S4 --> S5["信心門檻 + closing + dilation"]
-        S5 --> S6{"有效臉部區域？"}
-        S6 -->|是| S7["依遮罩裁切<br/>背景設為黑色"]
-        S6 -->|否| S8["記錄 no_face<br/>不輸出 JPG"]
-        S7 --> S9{"metadata label"}
-        S9 -->|0 real| S10["DFDC-SegFace-normal"]
-        S9 -->|1 fake| S11["DFDC-SegFace-anomaly"]
-    end
-
-    R11 --> S1
+```bash
+bash mission.sh stage1 \
+  --stage prepare \
+  --exper SEGFACE_FROZEN_NN_V1 \
+  --face-source segface \
+  --no-tune-encoder \
+  --method nearest
 ```
 
-### 前處理輸入與輸出
+## 2. 完整流程
 
-| 項目 | 目前位置／格式 |
+```mermaid
+flowchart LR
+    A["DFDC MP4<br/>+ test.csv"] --> B["RetinaFace<br/>抽幀與人臉裁切"]
+    B --> C["224 × 224 JPG<br/>+ metadata.json"]
+    C -->|face-source=retinaface| F["Stage 1<br/>建立 real feature bank"]
+    C --> D["SegFace<br/>語意遮罩與去背景"]
+    D --> E["純人臉 JPG<br/>real / fake 分開保存"]
+    E -->|face-source=segface| F
+    F --> G["Stage 2<br/>校準門檻與評估"]
+    G --> H["metrics.json<br/>evaluation_scores.json<br/>patch_matches/*.npz"]
+```
+
+`--face-source retinaface|segface` 只改變 DINOv3 讀取的 JPG。兩種來源都使用 RetinaFace 的 `metadata.json` 與 DFDC 原始 metadata 維持相同的影片標籤和來源 family 關係。
+
+## 3. 人臉前處理
+
+```mermaid
+flowchart LR
+    A["影片順序解碼一次"] --> B["均勻選 num_frames 幀"]
+    B --> C["detection_batch_size<br/>批次 RetinaFace"]
+    C --> D{"偵測到人臉？"}
+    D -->|是| E["選最大人臉<br/>加 margin 後裁切 224 × 224"]
+    D -->|否| F["metadata：no_face"]
+    E --> G["JPG + metadata.json"]
+    F --> G
+    G --> H["batch SegFace Swin-B"]
+    H --> I["保留皮膚、耳朵、五官與眼鏡"]
+    I --> J["closing + dilation<br/>背景設為黑色"]
+    J --> K{"label"}
+    K -->|real=0| L["DFDC-SegFace-normal"]
+    K -->|fake=1| M["DFDC-SegFace-anomaly"]
+```
+
+### 輸入與輸出
+
+| 資料 | 位置／格式 |
 | --- | --- |
 | DFDC 影片 | `crop_face.data_root` |
-| DFDC 標籤 | `crop_face.label_csv` |
-| RetinaFace 輸出 | `/ssd8/chihyu/Dataset/DeepFake_Dataset/DFDC/<part>/<video>/` |
+| DFDC 清單 | `crop_face.label_csv` |
+| RetinaFace | `/ssd8/chihyu/Dataset/DeepFake_Dataset/DFDC/<part>/<video>/` |
 | RetinaFace 檔案 | `frame_*.jpg`、`metadata.json` |
 | SegFace real | `/ssd8/chihyu/Dataset/DeepFake_Dataset/DFDC-SegFace-normal/` |
 | SegFace fake | `/ssd8/chihyu/Dataset/DeepFake_Dataset/DFDC-SegFace-anomaly/` |
 
-SegFace 會將來源路徑展平成可追溯檔名，例如：
+SegFace 採用可追溯的扁平檔名：
 
 ```text
 dfdc_train_part_0-video_name-frame_000001.jpg
 ```
 
-### 續跑判斷
+### 續跑與測試
 
-```mermaid
-flowchart LR
-    A["啟動任務"] --> B{"輸出存在且設定一致？"}
-    B -->|是| C["自動跳過"]
-    B -->|否| D["只處理缺少或未完成項目"]
-    D --> E["完成後安全寫入輸出"]
-    F["加入 --overwrite"] --> G["忽略既有結果並重做"]
-```
-
-一般續跑不要加入 `--overwrite`。RetinaFace 以整支影片和 `metadata.json` 判斷完成狀態；SegFace 逐張檢查目標 JPG。兩者都使用 `tqdm`：RetinaFace 顯示一條總進度，SegFace 每張 GPU 顯示一條進度。
-
-### 少量測試與 CPU 模式
+- RetinaFace 以整支影片的 `metadata.json` 與設定判斷是否完成。
+- SegFace 逐張檢查目標 JPG；已完成圖片自動跳過。
+- 一般續跑不要加入 `--overwrite`；該參數會強制重做。
+- RetinaFace 顯示一條總 `tqdm`；SegFace 每張 GPU 顯示一條 `tqdm`。
 
 ```bash
-# RetinaFace：兩支影片、每支四幀
+# 小型 RetinaFace 測試：兩支影片、每支四幀
 bash mission.sh crop-face --limit 2 --num-frames 4 --gpus 0
 
-# SegFace：每類一支影片、每支一張
+# 小型 SegFace 測試：每類一支影片、每支一張
 bash mission.sh segment-face --limit 1 --frames-per-video 1 --cores 1 --gpus 0
 
-# RetinaFace CPU
-bash mission.sh crop-face \
-  --num-frames 32 \
-  --gpus none \
-  --device cpu \
-  --workers 8 \
-  --cpu-threads 2
+# RetinaFace CPU 模式
+bash mission.sh crop-face --num-frames 32 \
+  --gpus none --device cpu --workers 8 --cpu-threads 2
 ```
 
-## Feature bank 流程
+## 4. Feature bank
 
-```mermaid
-flowchart TD
-    A["RetinaFace metadata<br/>+ 選定的 face source JPG"] --> B["依原始來源 family 固定切分"]
-    B --> B1["bank：real"]
-    B --> B2["calibration：real"]
-    B --> B3["evaluation：real + fake"]
+### 固定資料切分
 
-    subgraph ST1["Stage 1：只建立正常參考庫"]
-        B1 --> C{"encoder_tuning.enabled？"}
-        C -->|true| D["訓練最後一層 DINOv3 LoRA<br/>壓縮一致性 + 局部 pseudo anomaly"]
-        C -->|false| E["使用凍結 DINOv3"]
-        D --> F["以相同 encoder 提取 real patch features"]
-        E --> F
-        F --> G["移除黑色背景 patch"]
-        G --> H["建立 cosine real bank 索引"]
-        H --> I{"method"}
-        I -->|cross_attention| J["用 bank real 訓練受限 Q/K attention"]
-        I -->|nearest / topk| K["Stage 1 完成"]
-        J --> K
-    end
+切分單位是 DFDC 原片與其 fake 衍生影片所形成的來源 family。同一 family 不會跨越 Stage 1、calibration 與 evaluation。
 
-    subgraph ST2["Stage 2：校準與評估"]
-        B2 --> L["使用 Stage 1 的同一 encoder 提取特徵"]
-        B3 --> L
-        K --> M["載入 real bank 與模型雜湊"]
-        L --> N["查詢 real bank"]
-        M --> N
-        N --> O["計算每個前景 patch 的異常距離"]
-        O --> P["最高 top_fraction 距離平均<br/>預設最高 10%"]
-        P --> Q["calibration real 分數"]
-        P --> R["evaluation 分數"]
-        Q --> S["第 threshold_quantile 分位門檻<br/>預設 99%"]
-        S --> T["prediction + metrics"]
-        R --> T
-        T --> U["JSON 指標 + NPZ patch 匹配證據"]
-    end
-```
+目前 `SEGFACE_FROZEN_NN_V1` 的完整切分：
 
-### Stage 1 在做什麼
+| Role | 影片 | 圖片 | 標籤 | 使用階段 |
+| --- | ---: | ---: | --- | --- |
+| `bank` | 1,304 | 41,570 | real | Stage 1 |
+| `train_fake` | 7,189 | 229,217 | fake | 目前 baseline 不使用 |
+| `calibration` | 279 | 8,897 | real | Stage 2 門檻 |
+| `evaluation` | 3,141 | 100,107 | real + fake | Stage 2 評估 |
 
-Stage 1 的目標是把 **real 人臉轉成可搜尋的正常 patch 參考庫**。它不設定異常門檻，也不計算測試指標。
+### Stage 1：建立正常參考庫
+
+Stage 1 將 `bank` 中的 real 人臉轉成可搜尋的正常 patch 參考庫。它不設定異常門檻，也不計算測試指標。
 
 ```mermaid
 flowchart LR
-    A["固定來源 family 切分<br/>splits.json"] --> B["只取 bank role 的 real JPG"]
-    B --> C{"是否啟用 LoRA？"}
-    C -->|否| D["Frozen DINOv3"]
-    C -->|是| E["先訓練 LoRA<br/>再載入最佳權重"]
-    D --> F["每張圖提取 patch tokens"]
-    E --> F
-    F --> G["每張圖保存一個 float16 NPY<br/>目前為 14 × 14 × 768"]
-    G --> H["依黑色背景比例<br/>移除非臉部 patch"]
-    H --> I["合併全部 real patches"]
-    I --> J["建立 features / origins / patch_ids"]
-    J --> K["寫入 retrieval.json<br/>記錄數量、設定與 SHA-256"]
+    A["bank role<br/>real JPG"] --> B{"Encoder"}
+    B -->|--no-tune-encoder| C["Frozen DINOv3"]
+    B -->|啟用 LoRA| D["訓練 LoRA<br/>載入最佳權重"]
+    C --> E["提取 patch tokens"]
+    D --> E
+    E --> F["每張圖一個 float16 NPY<br/>目前 14 × 14 × 768"]
+    F --> G["移除黑色背景 patch"]
+    G --> H["合併 real patches"]
+    H --> I["features.npy<br/>origins.npy<br/>patch_ids.npy"]
+    I --> J["retrieval.json<br/>設定與 SHA-256"]
 ```
 
-| 步驟 | Stage 1 的行為 | 主要輸出 |
-| --- | --- | --- |
-| 1. 固定切分 | 依原始影片 family 分成 `bank`、`train_fake`、`calibration`、`evaluation`；重跑沿用同一份切分 | `splits.json` |
-| 2. Encoder | `--no-tune-encoder` 使用 frozen DINOv3；啟用時才先訓練最後一層 LoRA | 選用的 `dino_lora.safetensors` |
-| 3. 提取表徵 | 只提取 `bank` 中的 real 圖片；目前每張 224×224 圖片得到 `14×14×768` patch features | `<part>/<video>/frame_*.npy` |
-| 4. 前景篩選 | 依 JPG 非黑色像素占比保留臉部 patch；`foreground_minimum` 預設 0.5 | 前景 patch 清單 |
-| 5. 建立索引 | 合併 real patches，並保存每個 patch 的來源圖片與空間位置 | `retrieval/features.npy`、`origins.npy`、`patch_ids.npy`、`sources.json` |
-| 6. 完成驗證 | 記錄設定與檔案雜湊；相同實驗重跑時檢查並沿用完成的快取 | `stage1/retrieval.json` |
+Stage 1 依序完成：
 
-目前 `SEGFACE_FROZEN_NN_V1` 的 Stage 1 輸入為 1,304 支 real 影片、41,570 張 SegFace JPG。`train_fake`、`calibration` 與 `evaluation` 不會在這個 baseline 的 Stage 1 提取；後兩者留到 Stage 2。
+1. 建立或沿用 `splits.json`。
+2. 依設定使用 frozen DINOv3，或先訓練最後一層 LoRA。
+3. 只提取 `bank` real 圖片；目前每張 224×224 圖片得到 `14×14×768` patch features。
+4. 將每張圖片保存為 `<part>/<video>/frame_*.npy`，中斷後可逐檔續接。
+5. 依 `foreground_minimum` 移除黑色背景比例過高的 patch。
+6. 合併 real patches，保存來源圖片和空間位置，再寫入完成紀錄與檔案雜湊。
 
-訓練、校準與評估的來源 family 不重疊。fake 不會進入 real bank；目前 `encoder_tuning.fake_weight: 0.0`，LoRA 也不讀取真實 fake。
+如果 `method=cross_attention`，Stage 1 會在 real bank 建立後額外訓練受限 Q/K attention。`nearest` 與 `topk` 不需要這一步。
 
-### 評分方法
+### Stage 2：校準與評估
+
+Stage 2 載入 Stage 1 的同一 encoder 與 real bank，接著：
+
+1. 提取 `calibration` 與 `evaluation` 圖片的 patch features。
+2. 讓每個前景 patch 查詢 real bank，取得異常距離與參考來源。
+3. 將最高 `top_fraction` 距離取平均；預設使用最高 10% patch。
+4. 只用 calibration real 分數的第 `threshold_quantile` 分位設定門檻；預設 99%。
+5. 對 evaluation real/fake 計算 AUROC、AP、FPR、TPR，並保存完整 patch 匹配證據。
 
 | `retrieval.method` | Patch 異常距離 |
 | --- | --- |
@@ -217,7 +188,7 @@ flowchart LR
 | `topk` | Top-K real patches 經 cosine softmax 加權後的重建誤差 |
 | `cross_attention` | 受限多頭 Q/K attention 對 Top-K real values 的重建誤差 |
 
-目前 YAML 預設為 `topk`。圖片分數是最高 10% 前景 patch 距離的平均值；分數越高代表越偏離 real bank，並不是 fake 機率。
+圖片分數代表偏離 real bank 的程度，不是 fake 機率。
 
 ### Feature bank 輸出
 
@@ -225,54 +196,58 @@ flowchart LR
 RAG/normal/<EXPERIMENT>/
   bank_config.json
   splits.json
-  <part>/<video>/*.npy
-  retrieval/                     # real bank 索引
-  cache/calibration/             # 不會加入 real bank
-  cache/evaluation/              # 不會加入 real bank
+  <part>/<video>/frame_*.npy
+  retrieval/
+    features.npy
+    origins.npy
+    patch_ids.npy
+  cache/
+    calibration/
+    evaluation/
 
 outputs/feature_bank/<EXPERIMENT>/
-  stage1/config.json
-  stage1/splits.json
-  stage1/retrieval.json
-  stage1/dino_lora.safetensors   # 啟用 LoRA 時存在
-  stage1/attention.json          # cross_attention 時存在
-  stage2/thresholds.json
-  stage2/metrics.json
-  stage2/evaluation_scores.json
-  stage2/*/patch_matches/*.npz
+  stage1/
+    config.json
+    splits.json
+    sources.json
+    retrieval.json
+    dino_lora.safetensors        # 只有啟用 LoRA 時存在
+    attention.json               # 只有 cross_attention 時存在
+  stage2/
+    thresholds.json
+    metrics.json
+    evaluation_scores.json
+    */patch_matches/*.npz
 ```
 
-## 設定位置
+## 5. 設定與資源
 
-命令列參數會覆寫 `utils/config.yaml`：
+命令列參數優先於 `utils/config.yaml`。
 
 | YAML 區塊 | 控制內容 |
 | --- | --- |
-| `crop_face` | DFDC 路徑、GPU、抽幀、RetinaFace batch、門檻、margin、輸出大小 |
-| `segment_face` | SegFace 模型、輸入輸出、batch、遮罩類別與形態學參數 |
-| `mission` | SegFace 的預設 CPU 核心與 GPU 清單 |
-| `retrieval` | 人臉來源、實驗名稱、GPU、DINO batch、LoRA、檢索方法、門檻與消融 |
+| `crop_face` | DFDC 路徑、抽幀、RetinaFace GPU／batch、門檻、margin、輸出大小 |
+| `segment_face` | SegFace 模型、輸入輸出、batch、遮罩與形態學參數 |
+| `mission` | SegFace 預設 CPU 核心與 GPU 清單 |
+| `retrieval` | 人臉來源、實驗名稱、DINO GPU／batch、LoRA、檢索、門檻與消融 |
 | `model_path` | 本地 DINOv3 模型目錄 |
 
-常用資源參數：
-
-| 參數 | 用途 |
+| 常用參數 | 用途 |
 | --- | --- |
 | `crop-face --detection-batch-size N` | 每次 RetinaFace 推論的幀數 |
 | `segment-face --batch-size N` | 每個 SegFace worker 的圖片 batch |
-| `segment-face --cores N` | 所有 SegFace worker 共用的 CPU 核心總數 |
+| `segment-face --cores N` | SegFace 使用的 CPU 核心總數；至少等於 GPU 數量 |
 | `stage1/2 --batch-size N` | 每張 GPU 的 DINO 圖片 batch |
 | `stage1/2 --workers N` | 所有 GPU 共用的 JPG／NPY 讀取執行緒上限 |
 
-## 模型與依賴
+### 模型與依賴
 
 ```bash
-# 依賴
 conda run -n pt230 python -m pip install \
   -r requirements-crop.txt \
   -r requirements-segment.txt
 
-# SegFace 權重缺少時重新安裝
+# SegFace 權重缺少時執行
 conda run --no-capture-output -n pt230 \
   python -m script.setup_segface
 ```
@@ -283,16 +258,23 @@ conda run --no-capture-output -n pt230 \
 | SegFace Swin-B | `models/segface/swinb_celeba_512/model.safetensors` |
 | DINOv3 | `model_path`，預設 `models/dinov3-vitb16-pretrain-lvd1689m` |
 
-## 執行規則
+## 6. 實驗規則
 
-1. Stage 1 與 Stage 2 必須使用相同的 `--exper`。
-2. 修改資料、模型、LoRA 或評分設定時，使用新的實驗名稱。
-3. `stage2` 需要已完成且雜湊驗證成功的 Stage 1。
-4. `ablation` 在 Stage 2 後執行，不會覆寫主要結果。
-5. 輸出目錄有程序鎖；同一實驗或同一 SegFace 輸出不可重複啟動。
-6. 目前評估是 DFDC 清單內的來源家族切分，不是官方 DFDC test，也不是 identity-disjoint 結果。
+1. Stage 1 與 Stage 2 必須使用完全相同的 `--exper`、`--face-source`、encoder 與 `--method`。
+2. 修改資料、模型、LoRA 或評分設定時，建立新的實驗名稱。
+3. Stage 2 只接受已完成且雜湊驗證成功的 Stage 1。
+4. 相同實驗可直接續跑；輸出鎖會阻止同一實驗重複啟動。
+5. `ablation` 需在 Top-K Stage 2 完成後執行，且不覆寫主要結果。
+6. 目前結果是 DFDC 清單內的來源 family 切分，不是官方 DFDC test，也不是 identity-disjoint 評估。
 
-查看入口說明：
+建議依序比較：
+
+1. SegFace + frozen DINOv3 + nearest。
+2. RetinaFace + frozen DINOv3 + nearest。
+3. SegFace + frozen DINOv3 + topk。
+4. SegFace + LoRA + topk。
+
+每個實驗只改一個因素，才能判斷改善來自前處理、encoder 或評分方式。
 
 ```bash
 bash mission.sh --help
