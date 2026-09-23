@@ -177,6 +177,36 @@ flowchart TD
     end
 ```
 
+### Stage 1 在做什麼
+
+Stage 1 的目標是把 **real 人臉轉成可搜尋的正常 patch 參考庫**。它不設定異常門檻，也不計算測試指標。
+
+```mermaid
+flowchart LR
+    A["固定來源 family 切分<br/>splits.json"] --> B["只取 bank role 的 real JPG"]
+    B --> C{"是否啟用 LoRA？"}
+    C -->|否| D["Frozen DINOv3"]
+    C -->|是| E["先訓練 LoRA<br/>再載入最佳權重"]
+    D --> F["每張圖提取 patch tokens"]
+    E --> F
+    F --> G["每張圖保存一個 float16 NPY<br/>目前為 14 × 14 × 768"]
+    G --> H["依黑色背景比例<br/>移除非臉部 patch"]
+    H --> I["合併全部 real patches"]
+    I --> J["建立 features / origins / patch_ids"]
+    J --> K["寫入 retrieval.json<br/>記錄數量、設定與 SHA-256"]
+```
+
+| 步驟 | Stage 1 的行為 | 主要輸出 |
+| --- | --- | --- |
+| 1. 固定切分 | 依原始影片 family 分成 `bank`、`train_fake`、`calibration`、`evaluation`；重跑沿用同一份切分 | `splits.json` |
+| 2. Encoder | `--no-tune-encoder` 使用 frozen DINOv3；啟用時才先訓練最後一層 LoRA | 選用的 `dino_lora.safetensors` |
+| 3. 提取表徵 | 只提取 `bank` 中的 real 圖片；目前每張 224×224 圖片得到 `14×14×768` patch features | `<part>/<video>/frame_*.npy` |
+| 4. 前景篩選 | 依 JPG 非黑色像素占比保留臉部 patch；`foreground_minimum` 預設 0.5 | 前景 patch 清單 |
+| 5. 建立索引 | 合併 real patches，並保存每個 patch 的來源圖片與空間位置 | `retrieval/features.npy`、`origins.npy`、`patch_ids.npy`、`sources.json` |
+| 6. 完成驗證 | 記錄設定與檔案雜湊；相同實驗重跑時檢查並沿用完成的快取 | `stage1/retrieval.json` |
+
+目前 `SEGFACE_FROZEN_NN_V1` 的 Stage 1 輸入為 1,304 支 real 影片、41,570 張 SegFace JPG。`train_fake`、`calibration` 與 `evaluation` 不會在這個 baseline 的 Stage 1 提取；後兩者留到 Stage 2。
+
 訓練、校準與評估的來源 family 不重疊。fake 不會進入 real bank；目前 `encoder_tuning.fake_weight: 0.0`，LoRA 也不讀取真實 fake。
 
 ### 評分方法
