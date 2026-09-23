@@ -9,15 +9,16 @@ flowchart LR
     A["DFDC 原始影片<br/>MP4 + test.csv"] --> B["RetinaFace<br/>crop-face"]
     B --> C["人臉 JPG + metadata.json<br/>依 part / video 保存"]
     C --> D{"下一步"}
-    D -->|目前檢索輸入| E["Stage 1<br/>real feature bank"]
-    D -->|選用去背景資料| F["SegFace<br/>segment-face"]
+    D -->|--face-source retinaface| E["Stage 1<br/>real feature bank"]
+    D -->|純臉去背景資料| F["SegFace<br/>segment-face"]
     F --> G["real / fake 分開保存<br/>黑色背景 JPG"]
+    G -->|--face-source segface| E
     E --> H["Stage 2<br/>校準 + 評估"]
     H --> I["分數、門檻、指標<br/>patch 匹配證據"]
     H --> J["Ablation<br/>邊界與來源家族限制"]
 ```
 
-目前 Stage 1 直接讀取 `crop_face.output_dir` 的 RetinaFace 結果。SegFace 是獨立輸出分支，不會自動改變 feature bank 的輸入。
+`--face-source retinaface|segface` 決定 Stage 1 使用原始人臉框或 SegFace 純臉 JPG；兩者都沿用 RetinaFace 的 `metadata.json` 做來源 family 切分。
 
 ## 快速開始
 
@@ -35,12 +36,16 @@ bash mission.sh segment-face \
   --gpus 0,1,2,3,4 \
   --batch-size 8
 
-# 3. Feature bank：兩階段必須使用相同實驗名稱
-bash mission.sh stage1 --exper EXP_01 --gpus 0 1 2 3 4 --batch-size 8
-bash mission.sh stage2 --exper EXP_01 --gpus 0 1 2 3 4 --batch-size 8
+# 3. 第一個研究基準：SegFace + frozen DINOv3 + 1-NN
+bash mission.sh stage1 --exper SEGFACE_FROZEN_NN_V1 \
+  --face-source segface --no-tune-encoder --method nearest \
+  --gpus 0 1 2 3 4 --batch-size 8
+bash mission.sh stage2 --exper SEGFACE_FROZEN_NN_V1 \
+  --face-source segface --no-tune-encoder --method nearest \
+  --gpus 0 1 2 3 4 --batch-size 8
 
-# 4. Stage 2 完成後才執行消融
-bash mission.sh ablation --exper EXP_01 --gpus 0 1 2 3 4
+# 4. 完成 nearest baseline 後，再另建 topk 實驗與消融
+# bash mission.sh ablation --exper <已完成的 TOPK 實驗> --method topk ...
 ```
 
 GPU 參數有兩種格式：
@@ -136,7 +141,7 @@ bash mission.sh crop-face \
 
 ```mermaid
 flowchart TD
-    A["RetinaFace JPG + metadata"] --> B["依原始來源 family 固定切分"]
+    A["RetinaFace metadata<br/>+ 選定的 face source JPG"] --> B["依原始來源 family 固定切分"]
     B --> B1["bank：real"]
     B --> B2["calibration：real"]
     B --> B3["evaluation：real + fake"]
@@ -216,7 +221,7 @@ outputs/feature_bank/<EXPERIMENT>/
 | `crop_face` | DFDC 路徑、GPU、抽幀、RetinaFace batch、門檻、margin、輸出大小 |
 | `segment_face` | SegFace 模型、輸入輸出、batch、遮罩類別與形態學參數 |
 | `mission` | SegFace 的預設 CPU 核心與 GPU 清單 |
-| `retrieval` | 實驗名稱、GPU、DINO batch、LoRA、檢索方法、門檻與消融 |
+| `retrieval` | 人臉來源、實驗名稱、GPU、DINO batch、LoRA、檢索方法、門檻與消融 |
 | `model_path` | 本地 DINOv3 模型目錄 |
 
 常用資源參數：

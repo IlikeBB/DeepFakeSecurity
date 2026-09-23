@@ -34,6 +34,7 @@ bank_probe:
 # 直接查詢 real patch bank；無分類器訓練，train_fake 保留切分但不使用。
 retrieval:
   experiment: null  # LoRA 會產生全新表徵，請自行填入新名稱；Stage 1／Stage 2 共用
+  face_source: segface  # segface：純臉遮罩 JPG；retinaface：原始 224x224 人臉框
   method: topk  # 以 real bank Top-K cosine 相似度判斷；cross_attention 僅保留作消融
   encoder_tuning:
     enabled: true  # 最後一個 DINOv3 block 的 Q/K/V 加 LoRA；原始模型保持凍結

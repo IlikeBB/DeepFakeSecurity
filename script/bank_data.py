@@ -101,8 +101,17 @@ def select_full_groups(candidates, seed):
 def prepare_plan(config, bank_only=False):
     faces_root = Path(config["faces_dir"])
     source_root = Path(config["source_root"])
+    face_source = config.get("face_source", "retinaface")
+    if face_source not in ("retinaface", "segface"):
+        raise ValueError("face_source must be retinaface or segface")
+    segmented = ({0: Path(config["segface_normal_dir"]), 1: Path(config["segface_anomaly_dir"])}
+                 if face_source == "segface" else None)
     if not faces_root.is_dir():
         raise FileNotFoundError(f"Face crop directory does not exist: {faces_root}")
+    if segmented:
+        for directory in segmented.values():
+            if not directory.is_dir():
+                raise FileNotFoundError(f"SegFace directory does not exist: {directory}")
     with Path(config["label_csv"]).open(encoding="utf-8-sig", newline="") as file:
         rows = list(csv.DictReader(file))
     labels = {}
@@ -132,7 +141,19 @@ def prepare_plan(config, bank_only=False):
         if original["label"] != ("FAKE" if labels[stem] else "REAL"):
             raise ValueError(f"Source/CSV label mismatch: {stem}")
         group = Path(original["original"]).stem if labels[stem] else stem
-        frames = sorted((f for f in data["frames"] if f["status"] == "ok"), key=lambda f: f["frame_index"])
+        frames = []
+        for frame in sorted((f for f in data["frames"] if f["status"] == "ok"),
+                            key=lambda f: f["frame_index"]):
+            if segmented:
+                filename = f"{part}-{stem}-{Path(frame['file']).with_suffix('.jpg').name}"
+                path = (segmented[labels[stem]] / filename).resolve()
+                if not path.is_file():
+                    continue
+            else:
+                path = (manifest.parent / frame["file"]).resolve()
+                if manifest.parent.resolve() not in path.parents:
+                    raise ValueError(f"Crop path escapes its video directory: {path}")
+            frames.append((frame, path))
         if not frames:
             no_faces += 1
             continue
@@ -140,14 +161,11 @@ def prepare_plan(config, bank_only=False):
         indices = np.linspace(0, len(frames) - 1, count, dtype=int)
         selected = []
         for i in indices:
-            frame = frames[i]
-            path = (manifest.parent / frame["file"]).resolve()
-            if manifest.parent.resolve() not in path.parents:
-                raise ValueError(f"Crop path escapes its video directory: {path}")
+            frame, path = frames[i]
             selected.append({"image_path": str(path), "frame_index": frame["frame_index"]})
         candidates.append({"video_id": f"{part}/{stem}", "group_id": f"{part}/{group}",
                            "label": labels[stem], "source": data["source"],
-                           "crop_settings": data["settings"], "frames": selected})
+                           "crop_settings": dict(data["settings"], face_source=face_source), "frames": selected})
     if bank_only:
         random.Random(config["seed"]).shuffle(candidates)
         if not candidates:
@@ -164,7 +182,7 @@ def prepare_plan(config, bank_only=False):
                 stat = Path(frame["image_path"]).stat()
                 frame.update(size=stat.st_size, mtime_ns=stat.st_mtime_ns)
     protocol = ("Real-only independent image bank; no calibration or evaluation" if bank_only else
-                "All RetinaFace-cropped DFDC images; source-family-disjoint internal splits, "
+                f"All {face_source}-cropped DFDC images; source-family-disjoint internal splits, "
                 "not identity-disjoint or official test results" if config.get("full_data", False) else
                 "DFDC test-list pilot; source-family-disjoint internal splits, not official test results")
     return {"protocol": protocol,

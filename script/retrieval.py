@@ -18,6 +18,8 @@ def parse_args(argv=None):
     config = yaml.safe_load((root / "utils/config.yaml").read_text(encoding="utf-8"))
     defaults = dict(config["retrieval"], model_path=config["model_path"],
                     faces_dir=config["crop_face"]["output_dir"],
+                    segface_normal_dir=config["segment_face"]["normal_output_dir"],
+                    segface_anomaly_dir=config["segment_face"]["anomaly_output_dir"],
                     source_root=config["crop_face"]["data_root"],
                     label_csv=config["crop_face"]["label_csv"])
     parser = argparse.ArgumentParser(description=__doc__)
@@ -25,11 +27,16 @@ def parse_args(argv=None):
     parser.add_argument("--exper", "--experiment", dest="experiment")
     parser.add_argument("--gpus", dest="gpu_ids", type=int, nargs="*", help="GPU IDs; empty list uses CPU")
     parser.add_argument("--batch-size", "--extract-batch-size", dest="batch_size", type=int)
+    parser.add_argument("--face-source", choices=("retinaface", "segface"))
+    parser.add_argument("--tune-encoder", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--method", choices=("nearest", "topk", "cross_attention"), default="nearest")
     for key in ("workers", "cpu_threads", "query_chunk_size", "bank_chunk_size", "match_count"):
         parser.add_argument("--" + key.replace("_", "-"), type=int)
     parser.set_defaults(**defaults)
     args = parser.parse_args(argv)
+    if args.tune_encoder is not None:
+        args.encoder_tuning = dict(args.encoder_tuning, enabled=args.tune_encoder)
+    del args.tune_encoder
     if (not isinstance(args.experiment, str) or not args.experiment.strip()
             or args.experiment in (".", "..") or Path(args.experiment).name != args.experiment):
         parser.error("請先在 utils/config.yaml 的 retrieval.experiment 填入你取的實驗名稱，或使用 --exper 指定")
@@ -46,10 +53,15 @@ def parse_args(argv=None):
             or any(gpu < 0 or gpu >= torch.cuda.device_count() for gpu in args.gpu_ids)):
         parser.error("--gpus 請指定可用且不重複的 GPU 編號；空的 --gpus 使用 CPU")
     args.devices = [f"cuda:{gpu}" for gpu in args.gpu_ids]
-    for key in ("bank_dir", "results_dir", "model_path", "faces_dir", "source_root", "label_csv"):
+    for key in ("bank_dir", "results_dir", "model_path", "faces_dir", "segface_normal_dir",
+                "segface_anomaly_dir", "source_root", "label_csv"):
         setattr(args, key, str((root / Path(getattr(args, key)).expanduser()).resolve()))
+    if args.face_source == "segface":
+        for key in ("segface_normal_dir", "segface_anomaly_dir"):
+            if not Path(getattr(args, key)).is_dir():
+                parser.error(f"SegFace input directory does not exist: {getattr(args, key)}")
     for destination in (Path(args.bank_dir), Path(args.results_dir)):
-        for name in ("faces_dir", "source_root"):
+        for name in ("faces_dir", "segface_normal_dir", "segface_anomaly_dir", "source_root"):
             source = Path(getattr(args, name))
             if destination == source or source in destination.parents:
                 parser.error("輸出不能放入來源資料集")

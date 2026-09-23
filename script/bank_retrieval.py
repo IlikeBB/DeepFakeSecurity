@@ -14,7 +14,7 @@ from script.retrieval_io import load_sample, map_devices, metrics
 
 
 def foreground_patches(features, image_path, minimum):
-    """Estimate valid patch occupancy in a RetinaFace crop."""
+    """Estimate valid patch occupancy in a face crop."""
     h, w, _ = features.shape
     with Image.open(image_path) as image:
         mask = (np.asarray(image.convert("RGB")).max(axis=-1) > 16).astype(np.uint8) * 255
@@ -71,7 +71,7 @@ def build(plan, args, bank, output):
         save_array(files[key], np.concatenate(values))
     write_json(files["sources"], rows)
     write_json(completion, {
-        "method": "real RetinaFace crop patches; exact cosine 1-NN; highest-distance patch mean",
+        "method": f"real {args.face_source} face patches; exact cosine 1-NN; highest-distance patch mean",
         "image_count": len(rows), "patch_count": sum(len(values) for values in vectors),
         "foreground_minimum": args.foreground_minimum, "top_fraction": args.top_fraction,
         "plan_sha256": sha256(bank / "splits.json"),
