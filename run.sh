@@ -22,7 +22,7 @@ case "$stage" in
     cat <<'HELP'
 使用方式：bash run.sh [stage1|stage2|ablation|all] [其他參數]
 先在 utils/config.yaml 的 retrieval.experiment 填入名稱；其他設定也從 YAML 讀取。
-  stage1  訓練 DINOv3 LoRA、多 GPU 重建 real 特徵並建庫；cross_attention 模式才訓練 attention
+  stage1  合併內容重複家族後切分，提取 real 特徵並建庫；LoRA / attention 依設定選用
   stage2  提取保留組特徵，以 real 校準門檻，輸出測試指標及匹配明細
   ablation  比較 Top-K、邊界降權、來源家族去重及兩者合併
   all     依序完成兩階段
@@ -30,6 +30,8 @@ case "$stage" in
 預覽：retrieval.export_previews 設為 true 可輸出 PCA／JPG，預設 false。
 LoRA：retrieval.encoder_tuning.enabled=true 時使用第一張 GPU 訓練；其後特徵提取使用全部 GPU。
 命令列覆寫：--exper 名稱、--method nearest|topk|cross_attention，以及上述資源參數。
+新實驗預設合併重複內容及邊界降權；--boundary-weight 1 可測試未加權基準。
+舊實驗重現：--no-deduplicate-content --boundary-weight 1 --no-tune-encoder --method nearest。
 特徵：RAG/normal/<名稱>/；結果：outputs/feature_bank/<名稱>/stage1、stage2
 設定：utils/config.yaml 的 retrieval；執行環境：pt230。
 HELP

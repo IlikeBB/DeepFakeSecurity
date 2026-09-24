@@ -33,11 +33,13 @@ bank_probe:
 # 當前實驗：bash run.sh stage1/stage2 --exper FB_01
 # 直接查詢 real patch bank；無分類器訓練，train_fake 保留切分但不使用。
 retrieval:
-  experiment: null  # LoRA 會產生全新表徵，請自行填入新名稱；Stage 1／Stage 2 共用
+  experiment: null  # 切分／評分設定改變時使用新名稱；例如 SEGFACE_FROZEN_NN_DEDUP_V2
   face_source: segface  # segface：純臉遮罩 JPG；retinaface：原始 224x224 人臉框
-  method: topk  # 以 real bank Top-K cosine 相似度判斷；cross_attention 僅保留作消融
+  method: nearest  # 主基準：完整 real bank 全域 cosine 1-NN
+  deduplicate_content: true  # 切分前合併 JPEG 內容重複的來源家族及其 fake 衍生
+  boundary_weight: 0.5  # 遮罩邊界 patch 降權；1.0 為未加權基準，僅在 validation 比較
   encoder_tuning:
-    enabled: true  # 最後一個 DINOv3 block 的 Q/K/V 加 LoRA；原始模型保持凍結
+    enabled: false  # 先固定 encoder 驗證切分與評分；LoRA 留待獨立消融
     rank: 8
     alpha: 8.0
     epochs: 20
@@ -103,6 +105,65 @@ retrieval:
   match_count: 5  # JSON 顯示最多 5 個高異常 patch 的匹配；完整匹配存 NPZ
   pca_images: 32
   jpeg_quality: 95
+
+# Stage 2.5：凍結 DINO patch token 的 supervised PatchRelationMIL classifier。
+# checkpoint 位於 models/patch_mil/<experiment>/，結果位於 outputs/patch_mil/<experiment>/。
+patch_mil:
+  bank_dir: /ssd8/chihyu/Project/DeepFakeSecurity/RAG/normal
+  source_results_dir: /ssd8/chihyu/Project/DeepFakeSecurity/outputs/feature_bank
+  model_dir: models/patch_mil
+  results_dir: outputs/patch_mil
+  gpu_ids: [0]
+  extract_batch_size: 8
+  batch_size: 32
+  workers: 8
+  epochs: 12
+  patience: 3
+  minimum_delta: 0.0005
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  validation_fraction: 0.15
+  validation_images: 12000
+  images_per_epoch: 60000
+  hidden_dim: 256
+  heads: 4
+  layers: 2
+  dropout: 0.1
+  top_fraction: 0.1
+  real_patch_weight: 0.05
+  threshold_quantile: 0.99
+  seed: 42
+
+# 純 real Stage 2：position-aware prototype bank + PaDiM + relation consistency。
+# 程式碼位於 models/real_patch_bank.py，統計 checkpoint 位於 models/real_patch_bank/<experiment>/。
+real_patch_bank:
+  bank_dir: /ssd8/chihyu/Project/DeepFakeSecurity/RAG/normal
+  source_results_dir: /ssd8/chihyu/Project/DeepFakeSecurity/outputs/feature_bank
+  model_dir: models/real_patch_bank
+  results_dir: outputs/real_patch_bank
+  gpu_ids: [0]
+  workers: 12
+  batch_size: 32
+  extract_batch_size: 8
+  validation_fraction: 0.15  # bank real 內按 source family 留出，不參與統計 fitting
+  foreground_minimum: 0.5
+  spatial_grid: [7, 7]  # 14x14 token 合併為 coarse facial regions，容許小幅未對齊
+  spatial_restriction: false  # prototype 查詢先使用所有區域，空間限制保留作消融
+  clip_scores: false  # 保留低於 real median 的分數次序；舊 checkpoint 仍沿用原本截斷設定
+  neighbor_radius: 1  # 每個區域也使用相鄰區域 real patches，避免 SegFace 邊角樣本不足
+  patch_samples_per_region: 1024  # 每個區域保留的均勻 real patch sample
+  prototypes_per_region: 64  # PCA 空間 greedy coreset，再保存原始 normalized DINO token
+  pca_dim: 64
+  covariance_shrinkage: 0.1
+  covariance_ridge: 0.001
+  relation_std_floor: 0.05
+  minimum_relation_samples: 100
+  top_fraction: 0.1
+  score_weights: [1.0, 0.0, 0.0]  # nearest、Mahalanobis、relation；後兩者先只回報 component
+  normalization_quantile: 0.99  # 僅以 held-out bank real 對齊三種 score 尺度
+  threshold_quantile: 0.99  # 僅以 calibration real 設定最終異常門檻
+  top_patch_count: 5
+  seed: 42
 
 # SegFace 多 GPU 執行資源；每張 GPU 一個程序，CPU 核心平均分配。
 mission:

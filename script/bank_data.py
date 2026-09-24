@@ -5,8 +5,10 @@ import hashlib
 import json
 from pathlib import Path
 import random
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
+from tqdm.auto import tqdm
 
 
 def read_json(path):
@@ -34,6 +36,40 @@ def sha256(path):
         for chunk in iter(lambda: file.read(8 * 1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def merge_duplicate_families(candidates, workers=8):
+    """Keep exact image duplicates and all their source-family derivatives together."""
+    parents = {video["group_id"]: video["group_id"] for video in candidates}
+
+    def root(group):
+        while parents[group] != group:
+            parents[group] = parents[parents[group]]
+            group = parents[group]
+        return group
+
+    frames = [(video["group_id"], frame) for video in candidates for frame in video["frames"]]
+    seen, duplicate_hashes = {}, set()
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        hashes = pool.map(sha256, (frame["image_path"] for _, frame in frames))
+        for (group, frame), digest in tqdm(zip(frames, hashes), total=len(frames),
+                                          desc="Stage 1：合併重複內容家族", unit="image"):
+            frame["content_sha256"] = digest
+            previous = seen.setdefault(digest, group)
+            if previous != group:
+                duplicate_hashes.add(digest)
+            left, right = sorted((root(previous), root(group)))
+            parents[right] = left
+    merged = {}
+    for group in parents:
+        merged.setdefault(root(group), []).append(group)
+    for video in candidates:
+        original = video["group_id"]
+        video["source_group_id"] = original
+        video["group_id"] = root(original)
+    return {"method": "exact-jpeg-sha256-family-union-v1", "images_hashed": len(frames),
+            "cross_family_duplicate_hashes": len(duplicate_hashes),
+            "merged_families": [sorted(values) for _, values in sorted(merged.items()) if len(values) > 1]}
 
 
 def select_groups(candidates, config):
@@ -167,6 +203,9 @@ def prepare_plan(config, bank_only=False):
         candidates.append({"video_id": f"{part}/{stem}", "group_id": f"{part}/{group}",
                            "label": labels[stem], "source": data["source"],
                            "crop_settings": dict(data["settings"], face_source=face_source), "frames": selected})
+    duplicate_audit = None
+    if config.get("deduplicate_content", False):
+        duplicate_audit = merge_duplicate_families(candidates, config.get("workers", 8))
     if bank_only:
         random.Random(config["seed"]).shuffle(candidates)
         if not candidates:
@@ -186,9 +225,12 @@ def prepare_plan(config, bank_only=False):
                 f"All {face_source}-cropped DFDC images; source-family-disjoint internal splits, "
                 "not identity-disjoint or official test results" if config.get("full_data", False) else
                 "DFDC test-list pilot; source-family-disjoint internal splits, not official test results")
+    if duplicate_audit:
+        protocol += "; exact JPEG duplicates merged before splitting (not near-duplicate-disjoint)"
     return {"protocol": protocol,
             "audit": {"csv_videos": len(labels), "missing_manifests": len(labels.keys() - found),
-                      "zero_face_videos": no_faces, "eligible_videos": len(candidates)},
+                      "zero_face_videos": no_faces, "eligible_videos": len(candidates),
+                      **({"content_deduplication": duplicate_audit} if duplicate_audit else {})},
             "groups": groups}
 
 

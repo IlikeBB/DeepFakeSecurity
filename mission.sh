@@ -28,10 +28,12 @@ set -eo pipefail
 #   bash mission.sh stage2
 #   bash mission.sh all
 #   bash mission.sh ablation
+#   bash mission.sh real-patch-bank --stage fit --exper SEGFACE_FROZEN_NN_V1 --gpus 0
+#   bash mission.sh patch-mil --stage train --exper SEGFACE_FROZEN_NN_V1 --gpus 0
 
 task="${1:-crop-face}"
 case "$task" in
-  stage1|stage2|ablation|all) if (($#)); then shift; fi ;;
+  stage1|stage2|ablation|all|patch-mil|real-patch-bank) if (($#)); then shift; fi ;;
   crop-face|segment-face) if (($#)); then shift; fi ;;
   --help|-h)
     cat <<'HELP'
@@ -42,6 +44,8 @@ case "$task" in
   bash mission.sh stage2 [參數]     # 校準與評估
   bash mission.sh all [參數]        # 依序完成 Stage 1、Stage 2
   bash mission.sh ablation [參數]   # 固定檢索消融
+  bash mission.sh real-patch-bank [參數] # 純 real patch 統計模型
+  bash mission.sh patch-mil [參數]       # supervised patch-level 真偽分類器
 
 RetinaFace 多 GPU：--gpus 4,5,6（逗號分隔，每張 GPU 一個程序）
 RetinaFace CPU：--gpus none --device cpu --workers 8
@@ -68,5 +72,11 @@ conda activate pt230
 
 if [[ "$task" == segment-face ]]; then
   exec python -u -m script.mission "$@"
+fi
+if [[ "$task" == patch-mil ]]; then
+  exec python -u main.py --task patch-mil "$@"
+fi
+if [[ "$task" == real-patch-bank ]]; then
+  exec python -u main.py --task real-patch-bank "$@"
 fi
 exec python -u script/crop_face.py "$@"

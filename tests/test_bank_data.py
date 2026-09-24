@@ -8,11 +8,41 @@ from unittest.mock import patch
 
 import numpy as np
 
-from script.bank_data import prepare_plan
+from script.bank_data import prepare_plan, merge_duplicate_families, select_full_groups
 from script.retrieval_io import extract_roles
 
 
 class BankDataTests(unittest.TestCase):
+    def test_duplicate_family_union_is_transitive_and_keeps_derivatives(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            def video(name, group, label, contents):
+                frames = []
+                for i, content in enumerate(contents):
+                    path = Path(tmp) / f"{name}-{i}.jpg"
+                    path.write_bytes(content)
+                    frames.append({"image_path": str(path)})
+                return dict(video_id=name, group_id=group, label=label, frames=frames)
+            videos = [video("real_a", "a", 0, [b"first"]),
+                      video("real_b", "b", 0, [b"first", b"second"]),
+                      video("real_c", "c", 0, [b"second"]),
+                      video("fake_b", "b", 1, [b"fake"])]
+            videos += [video(f"real_{i}", f"other_{i}", 0, [str(i).encode()]) for i in range(20)]
+            audit = merge_duplicate_families(videos, workers=2)
+            self.assertEqual(audit["merged_families"], [["a", "b", "c"]])
+            self.assertEqual(audit["cross_family_duplicate_hashes"], 2)
+            self.assertEqual({v["group_id"] for v in videos[:4]}, {"a"})
+            self.assertEqual(videos[3]["source_group_id"], "b")
+            groups = select_full_groups(videos, seed=42)
+            partition = {v["video_id"]: ("training" if role in ("bank", "train_fake") else role)
+                         for role, values in groups.items() for v in values}
+            self.assertEqual(len({partition[v["video_id"]] for v in videos[:4]}), 1)
+            owners = {}
+            for role, values in groups.items():
+                role = "training" if role in ("bank", "train_fake") else role
+                for v in values:
+                    for frame in v["frames"]:
+                        self.assertEqual(owners.setdefault(frame["content_sha256"], role), role)
+
     def test_segface_source_keeps_metadata_and_skips_missing_masks(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

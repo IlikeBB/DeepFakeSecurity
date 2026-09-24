@@ -2,6 +2,11 @@
 
 本專案將 DFDC 影片轉成人臉資料，建立 DINOv3 real patch feature bank，再以獨立的 real calibration 與 real/fake evaluation 資料進行異常偵測。所有入口都會自動啟用 Conda 環境 `pt230`。
 
+目前主基準是 frozen DINOv3 + 完整 bank 全域 1-NN。新實驗預設在切分前合併 JPEG 內容
+重複的來源家族，並將遮罩邊界距離乘以 0.5 後取最高 10% 平均。這些是待驗證設定，
+既有 evaluation 上的診斷改善不代表新實驗已取得相同成績；評分參數應在 training 內另留的
+validation 上比較，calibration 僅設門檻，evaluation 不用於挑選參數。
+
 ## 1. 快速開始
 
 ```bash
@@ -20,7 +25,7 @@ bash mission.sh segment-face \
 
 # Step 3：frozen DINOv3 提取 real patch features 並建立 1-NN bank
 bash mission.sh stage1 \
-  --exper SEGFACE_FROZEN_NN_V1 \
+  --exper SEGFACE_FROZEN_NN_DEDUP_V2 \
   --face-source segface \
   --no-tune-encoder \
   --method nearest \
@@ -30,13 +35,44 @@ bash mission.sh stage1 \
 
 # Step 4：以 real calibration 設定門檻，再評估保留的 real/fake
 bash mission.sh stage2 \
-  --exper SEGFACE_FROZEN_NN_V1 \
+  --exper SEGFACE_FROZEN_NN_DEDUP_V2 \
   --face-source segface \
   --no-tune-encoder \
   --method nearest \
   --gpus 0 1 2 3 4 \
   --batch-size 8 \
   --workers 16
+
+# Step 5（選用消融）：只用 bank real fitting prototype anomaly model
+bash mission.sh real-patch-bank \
+  --stage fit \
+  --exper SEGFACE_FROZEN_NN_DEDUP_V2 \
+  --gpus 0
+
+# 只用 real calibration 設定門檻，再評估 real/fake
+bash mission.sh real-patch-bank \
+  --stage evaluate \
+  --exper SEGFACE_FROZEN_NN_DEDUP_V2 \
+  --gpus 0 1 2 3 4
+
+# Step 6（選用 supervised baseline）：訓練真偽分類器
+# 首次執行先以多 GPU 快取 train_fake features
+bash mission.sh patch-mil \
+  --stage cache \
+  --exper SEGFACE_FROZEN_NN_DEDUP_V2 \
+  --gpus 0 1 2 3 4
+
+# 訓練 classifier 時只使用第一張指定 GPU
+bash mission.sh patch-mil \
+  --stage train \
+  --exper SEGFACE_FROZEN_NN_DEDUP_V2 \
+  --gpus 0
+
+# 評估 supervised classifier
+bash mission.sh patch-mil \
+  --stage evaluate \
+  --exper SEGFACE_FROZEN_NN_DEDUP_V2 \
+  --gpus 0
 ```
 
 GPU 參數格式依入口不同：
@@ -44,14 +80,14 @@ GPU 參數格式依入口不同：
 | 任務 | GPU 格式 | 範例 |
 | --- | --- | --- |
 | `crop-face`、`segment-face` | 逗號分隔 | `--gpus 0,1,2,3,4` |
-| `stage1`、`stage2`、`ablation` | 空白分隔 | `--gpus 0 1 2 3 4` |
+| `stage1`、`stage2`、`ablation`、`real-patch-bank`、`patch-mil` | 空白分隔 | `--gpus 0 1 2 3 4` |
 
 只建立並檢查資料切分、不提取特徵：
 
 ```bash
 bash mission.sh stage1 \
   --stage prepare \
-  --exper SEGFACE_FROZEN_NN_V1 \
+  --exper SEGFACE_FROZEN_NN_DEDUP_V2 \
   --face-source segface \
   --no-tune-encoder \
   --method nearest
@@ -67,8 +103,12 @@ flowchart LR
     C --> D["SegFace<br/>語意遮罩與去背景"]
     D --> E["純人臉 JPG<br/>real / fake 分開保存"]
     E -->|face-source=segface| F
-    F --> G["Stage 2<br/>校準門檻與評估"]
-    G --> H["metrics.json<br/>evaluation_scores.json<br/>patch_matches/*.npz"]
+    F --> G["原始 Stage 2 baseline<br/>全域 real-bank 檢索"]
+    F --> H["RealPatchBank fitting<br/>只讀取 bank real"]
+    H --> I["Position-aware prototypes<br/>PaDiM + relation consistency"]
+    I --> J["Real calibration 設門檻<br/>real/fake evaluation"]
+    G --> K["baseline metrics"]
+    J --> L["real-only metrics<br/>component 指標 + top patches"]
 ```
 
 `--face-source retinaface|segface` 只改變 DINOv3 讀取的 JPG。兩種來源都使用 RetinaFace 的 `metadata.json` 與 DFDC 原始 metadata 維持相同的影片標籤和來源 family 關係。
@@ -132,7 +172,15 @@ bash mission.sh crop-face --num-frames 32 \
 
 ### 固定資料切分
 
-切分單位是 DFDC 原片與其 fake 衍生影片所形成的來源 family。同一 family 不會跨越 Stage 1、calibration 與 evaluation。
+切分單位是 DFDC 原片與其 fake 衍生影片所形成的來源 family。新實驗會先對所有候選圖片
+（含 train_fake）計算 JPEG SHA-256；任一圖片內容相同的 family 以連通群組合併，連同其 fake
+衍生影片一起切分。合併後的 `group_id` 不會跨越 training、calibration 與 evaluation；
+原始 family 保存在影片的 `source_group_id`，雜湊保存在 frame 的 `content_sha256`。
+`splits.json` 的 `audit.content_deduplication` 記錄合併清單。這不保證近重複或身份完全獨立。
+
+新的設定必須用新 experiment，例如 `SEGFACE_FROZEN_NN_DEDUP_V2`。舊 `V1` 的 splits、
+cache 與 model 不能直接搬過去，因為 role、group_id 及 sample_id 可能改變。若需重現舊版，
+Stage 1/2 均明確加上 `--no-deduplicate-content --boundary-weight 1 --no-tune-encoder --method nearest`。
 
 目前 `SEGFACE_FROZEN_NN_V1` 的完整切分：
 
@@ -163,7 +211,7 @@ flowchart LR
 
 Stage 1 依序完成：
 
-1. 建立或沿用 `splits.json`。
+1. 合併 exact JPEG 重複 family 後建立 `splits.json`，或沿用同設定的既有 split。
 2. 依設定使用 frozen DINOv3，或先訓練最後一層 LoRA。
 3. 只提取 `bank` real 圖片；目前每張 224×224 圖片得到 `14×14×768` patch features。
 4. 將每張圖片保存為 `<part>/<video>/frame_*.npy`，中斷後可逐檔續接。
@@ -179,7 +227,8 @@ Stage 2 載入 Stage 1 的同一 encoder 與 real bank，接著：
 1. 提取 `calibration` 與 `evaluation` 圖片的 patch features。
 2. 讓每個前景 patch 查詢 real bank，取得異常距離與參考來源。
 
-3. 將最高 `top_fraction` 距離取平均；預設使用最高 10% patch。
+3. 將遮罩四鄰域邊界（含影像外框）的距離乘以 `boundary_weight`，再取最高
+   `top_fraction` 平均；預設權重 0.5、最高 10%。`--boundary-weight 1` 是未加權基準。
 4. 只用 calibration real 分數的第 `threshold_quantile` 分位設定門檻；預設 99%。
 5. 對 evaluation real/fake 計算 AUROC、AP、FPR、TPR，並保存完整 patch 匹配證據。
 
@@ -194,6 +243,78 @@ Stage 2 會在提取圖片特徵前檢查每張 GPU 的可用顯存。目前完�
 | `cross_attention` | 受限多頭 Q/K attention 對 Top-K real values 的重建誤差 |
 
 圖片分數代表偏離 real bank 的程度，不是 fake 機率。
+JSON 的 top matches 依加權後的證據排序，`weighted_evidence` 是實際計分貢獻；
+`distance` / `anomaly_distance` 及 NPZ `distances` 仍保留原始距離，可搭配前景 mask、
+`retrieval.json` 的 `boundary_weight` 重算。校準與 evaluation 使用同一套權重。
+
+### Real-only Stage 2：RealPatchBank
+
+這是選用的 prototype 消融分支。它不讀取 `train_fake`，只把 `bank` real 依 `group_id` 再切成
+fitting 與 held-out real validation；`calibration` 仍只負責決定最終門檻。
+新 fitting 預設 `spatial_restriction=false`、`score_weights=[1,0,0]`：所有 prototypes
+共同查詢，Mahalanobis 與 relation 只回報 component 指標。`clip_scores=false` 保留低於
+real median 的分數次序，圖片 score 可以是負值；局部 anomaly map 仍顯示非負異常證據。
+原 checkpoint 缺少這兩個旗標時沿用舊版 spatial / clipping 行為，評估以 checkpoint 設定為準。
+需要測試原空間融合時，fitting 加上 `--spatial-restriction --clip-scores --score-weights 0.5 0.3 0.2`，
+並使用另一個實驗，避免覆寫既有模型。prototype 壓縮仍可能損失辨識能力，完整 1-NN 才是主基準。
+
+```mermaid
+flowchart LR
+    A["bank real<br/>14 × 14 × 768"] --> B["7 × 7 空間區域"]
+    B --> C["各區域選 prototypes<br/>預設全域 cosine 查詢"]
+    B --> D["相鄰區域 PCA 64 維 + Gaussian<br/>Mahalanobis 距離"]
+    B --> E["區域 cosine 關係<br/>real mean / std"]
+    C --> F["各項最高 10% 證據"]
+    D --> F
+    E --> F
+    F --> G["held-out real<br/>對齊三項 score 尺度"]
+    G --> H["預設只用 nearest<br/>另列 Mahalanobis / relation 指標"]
+    H --> I["calibration real q99 threshold"]
+    I --> J["evaluation + top anomaly patches"]
+```
+
+```bash
+# 建模；統計來源只有 bank real
+bash mission.sh real-patch-bank \
+  --stage fit \
+  --exper SEGFACE_FROZEN_NN_DEDUP_V2 \
+  --gpus 0
+
+# 可用多 GPU 平行評估；已存在的 calibration/evaluation cache 會直接沿用
+bash mission.sh real-patch-bank \
+  --stage evaluate \
+  --exper SEGFACE_FROZEN_NN_DEDUP_V2 \
+  --gpus 0 1 2 3 4
+```
+
+模型程式在 `models/real_patch_bank.py`，統計 checkpoint 在
+`models/real_patch_bank/<EXPERIMENT>/model.safetensors`。結果保存於
+`outputs/real_patch_bank/<EXPERIMENT>/`；`stage2/metrics.json` 同時列出 combined、nearest、Mahalanobis
+與 relation 的指標，`evaluation_scores.json` 則保留每張圖的 component score 與最高異常 patch 座標。
+
+### Stage 2.5：PatchRelationMIL 真偽分類器
+
+`PatchRelationMIL` 固定 DINOv3，讀取每張 SegFace 的 `14 × 14 × 768` patch feature，並以 Transformer
+建立 patch 間關係，再把 attention pooling 與最高分 patch 的 MIL pooling 合併為 real/fake score。黑色背景
+patch 不納入 attention、關係統計或 Top-K pooling。訓練的 real 來自 `bank`，fake 來自 `train_fake`；兩者會再依
+`group_id` 產生 family-disjoint validation split。`calibration` 與 `evaluation` 不會參與訓練。
+
+```text
+models/patch_mil/<EXPERIMENT>/
+  model.safetensors       # 最佳 validation AUROC checkpoint
+  model.json              # 模型、資料切分與 feature-bank 雜湊
+
+outputs/patch_mil/<EXPERIMENT>/
+  train_history.json
+  stage2/metrics.json
+  stage2/calibration_scores.json
+  stage2/evaluation_scores.json
+```
+
+這是使用 real/fake 標籤的 supervised 比較組，不屬於純 real feature-bank 方法。首次訓練會自動提取並快取
+`train_fake` 的 DINO features；模型與 checkpoint 放在 `models/patch_mil/`。
+如果訓練中斷，重新執行同一命令會沿用已完成快取。重新訓練既有 checkpoint 時加入 `--replace`。
+`--stage cache` 可使用多張 GPU；訓練與評估會使用 `--gpus` 中的第一張 GPU。
 
 ### Feature bank 輸出
 
@@ -235,6 +356,8 @@ outputs/feature_bank/<EXPERIMENT>/
 | `segment_face` | SegFace 模型、輸入輸出、batch、遮罩與形態學參數 |
 | `mission` | SegFace 預設 CPU 核心與 GPU 清單 |
 | `retrieval` | 人臉來源、實驗名稱、DINO GPU／batch、LoRA、檢索、門檻與消融 |
+| `real_patch_bank` | 純 real 空間 prototype、PCA/Gaussian、relation 與分數權重 |
+| `patch_mil` | supervised PatchRelationMIL 訓練與評估 |
 | `model_path` | 本地 DINOv3 模型目錄 |
 
 | 常用參數 | 用途 |
@@ -274,10 +397,12 @@ conda run --no-capture-output -n pt230 \
 
 建議依序比較：
 
-1. SegFace + frozen DINOv3 + nearest。
-2. RetinaFace + frozen DINOv3 + nearest。
-3. SegFace + frozen DINOv3 + topk。
-4. SegFace + LoRA + topk。
+1. SegFace + frozen DINOv3 + global nearest。
+2. RealPatchBank 的全域 prototype nearest，再比較空間限制。
+3. RealPatchBank 的 Mahalanobis。
+4. RealPatchBank 的 relation consistency。
+5. RealPatchBank 三項 combined score。
+6. PatchRelationMIL supervised baseline。
 
 每個實驗只改一個因素，才能判斷改善來自前處理、encoder 或評分方式。
 

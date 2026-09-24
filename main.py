@@ -21,6 +21,8 @@ def parse_args(argv=None):
     config.pop("mission", None)
     config.pop("bank_probe", None)
     config.pop("retrieval", None)
+    config.pop("patch_mil", None)
+    config.pop("real_patch_bank", None)
     parser = argparse.ArgumentParser(description="Extract DINOv3 features from Celeb-DF videos.")
     parser.add_argument("--data-root", type=Path)
     parser.add_argument("--model-path", type=Path)
@@ -63,7 +65,8 @@ if __name__ == "__main__":
     os.environ["USE_TF"] = "0"
     os.environ["USE_TORCH"] = "1"
     selector = argparse.ArgumentParser(add_help=False)
-    selector.add_argument("--task", choices=("bank-retrieval", "bank-probe", "segment-face", "extract"),
+    selector.add_argument("--task", choices=("bank-retrieval", "bank-probe", "patch-mil", "real-patch-bank",
+                                                    "segment-face", "extract"),
                           default="bank-retrieval")
     task, remaining = selector.parse_known_args()
     if task.task == "bank-retrieval":
@@ -72,6 +75,14 @@ if __name__ == "__main__":
         main(remaining)
     elif task.task == "bank-probe":
         from script.bank_probe import main
+
+        main(remaining)
+    elif task.task == "patch-mil":
+        from script.patch_mil import main
+
+        main(remaining)
+    elif task.task == "real-patch-bank":
+        from script.real_patch_bank import main
 
         main(remaining)
     elif task.task == "segment-face":

@@ -2,11 +2,32 @@ import unittest
 
 import numpy as np
 import torch
+from unittest.mock import patch
+from types import SimpleNamespace
 
 from script.bank_search import PatchBank
+from script.bank_retrieval import match_image
 
 
 class PatchBankTests(unittest.TestCase):
+    def test_weighted_score_matches_explanations_and_preserves_raw_distances(self):
+        distances = np.array([[.9, .1, .1, .1, .8, .1, .1, .1, .1]], dtype=np.float32)
+        search = SimpleNamespace(score=lambda *args: (np.array([.9]), distances, np.zeros((1, 9), dtype=int)))
+        sources = [dict(image_path="reference", video_id="real", group_id="family", grid=[3, 3])]
+        arrays = dict(origins=np.array([0]), patch_ids=np.array([0]))
+        info = dict(foreground_minimum=.5, top_fraction=.1, boundary_weight=.5)
+        with patch("script.bank_retrieval.foreground_patches",
+                   return_value=(np.ones((9, 2)), np.arange(9), (3, 3))):
+            result, distance_map, _ = match_image(None, "unused", search, info, sources, arrays, 1)
+            self.assertAlmostEqual(result["score"], .8, places=6)
+            self.assertEqual(result["matches"][0]["query_patch"], [1, 1])
+            self.assertAlmostEqual(result["matches"][0]["weighted_evidence"], .8, places=6)
+            np.testing.assert_array_equal(distance_map.flatten(), distances[0])
+            info.pop("boundary_weight")
+            legacy, _, _ = match_image(None, "unused", search, info, sources, arrays, 1)
+            self.assertAlmostEqual(legacy["score"], .9, places=6)
+            self.assertEqual(legacy["matches"][0]["query_patch"], [0, 0])
+
     def test_chunked_search_matches_cosine_nearest_neighbor(self):
         bank = np.array([[1, 0, 0], [0, 1, 0], [1, 1, 0], [0, 0, 1]], dtype=np.float16)
         patches = np.array([[[0.9, 0.1, 0], [0, 0.2, 0.8]]], dtype=np.float32)

@@ -25,15 +25,20 @@ def foreground_patches(features, image_path, minimum):
     return features.reshape(-1, features.shape[-1])[ids], ids, (h, w)
 
 
-def aggregate_patch_score(distances, ids, grid, fraction, boundary_weight=1.):
-    """Average the largest weighted patch errors; boundary is the foreground-mask edge."""
+def patch_evidence(distances, ids, grid, boundary_weight=1.):
+    """Weight mask-edge evidence while retaining raw distances for traceability."""
     mask = np.zeros(grid, dtype=bool)
     mask.reshape(-1)[ids] = True
     padded = np.pad(mask, 1, constant_values=False)
     interior = (mask & padded[:-2, 1:-1] & padded[2:, 1:-1]
                 & padded[1:-1, :-2] & padded[1:-1, 2:])
     weights = np.where(interior.reshape(-1)[ids], 1., boundary_weight)
-    evidence = np.asarray(distances) * weights
+    return np.asarray(distances) * weights
+
+
+def aggregate_patch_score(distances, ids, grid, fraction, boundary_weight=1.):
+    """Average the largest weighted patch errors; boundary is the foreground-mask edge."""
+    evidence = patch_evidence(distances, ids, grid, boundary_weight)
     count = max(1, math.ceil(len(evidence) * fraction))
     return float(np.sort(evidence)[-count:].mean())
 
@@ -71,9 +76,10 @@ def build(plan, args, bank, output):
         save_array(files[key], np.concatenate(values))
     write_json(files["sources"], rows)
     write_json(completion, {
-        "method": f"real {args.face_source} face patches; exact cosine 1-NN; highest-distance patch mean",
+        "method": f"real {args.face_source} face patches; exact cosine 1-NN; weighted highest-distance patch mean",
         "image_count": len(rows), "patch_count": sum(len(values) for values in vectors),
         "foreground_minimum": args.foreground_minimum, "top_fraction": args.top_fraction,
+        "boundary_weight": getattr(args, "boundary_weight", 1.),
         "plan_sha256": sha256(bank / "splits.json"),
         "source_config_sha256": sha256(bank / "bank_config.json"),
         "files": {key: {"path": str(path.resolve()), "sha256": sha256(path)} for key, path in files.items()},
@@ -105,7 +111,8 @@ def match_image(features, image_path, search, info, sources, arrays, match_count
     distances, neighbors = distances[0], neighbors[0]
     count = max(1, math.ceil(len(ids) * info["top_fraction"]))
     details = getattr(search, "details", None)
-    scoring = np.argsort(-distances, kind="stable")[:count]
+    evidence = patch_evidence(distances, ids, grid, info.get("boundary_weight", 1.))
+    scoring = np.argsort(-evidence, kind="stable")[:count]
     matches = []
     # These are the patches contributing most to the image's anomaly score.
     for position in scoring[:match_count]:
@@ -118,7 +125,8 @@ def match_image(features, image_path, search, info, sources, arrays, match_count
                         "source_patch": [source_patch // source["grid"][1], source_patch % source["grid"][1]],
                         "cosine_similarity": float(1 - (details["nearest_distances"][position] if details else distances[position])),
                         "distance": float(details["nearest_distances"][position] if details else distances[position]),
-                        "anomaly_distance": float(distances[position])})
+                        "anomaly_distance": float(distances[position]),
+                        "weighted_evidence": float(evidence[position])})
         if details:
             matches[-1]["reference_patch_ids"] = details["candidate_ids"][position].tolist()
             matches[-1]["reference_weights"] = details["weights"][position].tolist()
@@ -128,7 +136,8 @@ def match_image(features, image_path, search, info, sources, arrays, match_count
     neighbor_map.reshape(-1)[ids] = neighbors
     if details:
         details["query_patch_ids"] = ids
-    return {"score": float(scores[0]), "foreground_patches": len(ids), "scoring_patches": count,
+    score = float(scores[0]) if info.get("boundary_weight", 1.) == 1 else float(evidence[scoring].mean())
+    return {"score": score, "foreground_patches": len(ids), "scoring_patches": count,
             "matches": matches, **({"comparison_scores": details["scores"]} if details else {})}, distance_map, neighbor_map
 
 
@@ -213,6 +222,7 @@ def evaluate(plan, args, bank, cache, output):
             methods=comparison, retrieval_sha256=sha256(output / "stage1/retrieval.json"),
             attention_sha256=sha256(output / "stage1/attention.json") if attention else None))
     report = {"protocol": plan["protocol"], "method": info["method"] if method == "nearest" else method,
+              "boundary_weight": info.get("boundary_weight", 1.),
               "bank_images": info["image_count"], "bank_patches": info["patch_count"],
               "image": metrics(tested, threshold), **({"comparison": comparison} if comparison else {})}
     write_json(stage2 / "metrics.json", report)

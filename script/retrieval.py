@@ -30,6 +30,8 @@ def parse_args(argv=None):
     parser.add_argument("--face-source", choices=("retinaface", "segface"))
     parser.add_argument("--tune-encoder", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--method", choices=("nearest", "topk", "cross_attention"), default="nearest")
+    parser.add_argument("--deduplicate-content", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--boundary-weight", type=float, default=0.5)
     for key in ("workers", "cpu_threads", "query_chunk_size", "bank_chunk_size", "match_count"):
         parser.add_argument("--" + key.replace("_", "-"), type=int)
     parser.set_defaults(**defaults)
@@ -42,6 +44,8 @@ def parse_args(argv=None):
         parser.error("請先在 utils/config.yaml 的 retrieval.experiment 填入你取的實驗名稱，或使用 --exper 指定")
     if type(args.export_previews) is not bool:
         parser.error("utils/config.yaml 的 retrieval.export_previews 必須是 true 或 false")
+    if type(args.deduplicate_content) is not bool or not 0 <= args.boundary_weight <= 1:
+        parser.error("deduplicate_content 必須是 bool，boundary_weight 必須介於 0 與 1")
     if min(args.workers, args.cpu_threads, args.batch_size, args.query_chunk_size, args.bank_chunk_size,
            args.match_count, args.pca_images) < 1:
         parser.error("執行緒、batch 與 chunk 參數必須大於 0")
@@ -133,6 +137,11 @@ def main(argv=None):
                 files_sha256={name: sha256(Path(args.model_path) / name)
                               for name in ("model.safetensors", "config.json", "preprocessor_config.json")},
                 labels_sha256=sha256(args.label_csv))
+    # Explicit legacy settings preserve the exact old experiment specification.
+    if not args.deduplicate_content:
+        spec.pop("deduplicate_content")
+    if args.boundary_weight == 1:
+        spec.pop("boundary_weight")
     torch.set_num_threads(args.cpu_threads)
     torch.backends.cuda.matmul.allow_tf32 = False
     with experiment_lock(output), experiment_lock(bank), threadpool_limits(limits=args.cpu_threads):
@@ -140,6 +149,8 @@ def main(argv=None):
         plan_file = bank / "splits.json"
         if plan_file.exists():
             plan = read_json(plan_file)
+            if args.deduplicate_content and not plan.get("audit", {}).get("content_deduplication"):
+                raise ValueError("此 split 尚未合併重複內容；請使用新 experiment 重新 prepare")
         elif args.stage in ("prepare", "stage1", "all"):
             plan = prepare_plan(dict(vars(args), full_data=True))
             write_json(plan_file, plan)
