@@ -9,7 +9,8 @@ from PIL import Image
 from tqdm.auto import tqdm
 
 from script.bank_augmentation import load_bank_rows
-from script.bank_data import image_records, read_json, save_array, sha256, write_json
+from script.bank_data import (image_records, read_json, save_concatenated_array, sha256,
+                              write_json, write_json_list)
 from script.bank_search import PatchBank
 from script.retrieval_io import load_sample, map_devices, metrics
 
@@ -90,12 +91,16 @@ def build(plan, args, bank, output, rows=None):
     if augmentation_manifest.is_file():
         files['augmentation_manifest'] = augmentation_manifest
     for key, values in (("features", vectors), ("origins", origins), ("patch_ids", patches)):
-        save_array(files[key], np.concatenate(values))
-    write_json(files["sources"], rows)
+        save_concatenated_array(files[key], values, f"Stage 1：寫入 {key}")
+    write_json_list(files["sources"], rows, "Stage 1：寫入 sources", unit="image")
     augmentation = getattr(args, 'bank_augmentation', {'enabled': False})
     method = f"real {args.face_source} face patches; exact cosine 1-NN; weighted highest-distance patch mean"
     if augmentation.get('enabled'):
         method += '; original real patches + deterministic augmented-real patch subset'
+    file_info = {}
+    for key, path in files.items():
+        file_info[key] = {"path": str(path.resolve()),
+                          "sha256": sha256(path, f"Stage 1：SHA-256 {key}")}
     write_json(completion, {
         "method": method,
         "image_count": len(rows), "patch_count": sum(len(values) for values in vectors),
@@ -106,7 +111,7 @@ def build(plan, args, bank, output, rows=None):
         "boundary_weight": getattr(args, "boundary_weight", 1.),
         "plan_sha256": sha256(bank / "splits.json"),
         "source_config_sha256": sha256(bank / "bank_config.json"),
-        "files": {key: {"path": str(path.resolve()), "sha256": sha256(path)} for key, path in files.items()},
+        "files": file_info,
     })
 
 
@@ -117,8 +122,8 @@ def load_index(plan, bank, output):
     if (info["plan_sha256"] != sha256(bank / "splits.json")
             or info["source_config_sha256"] != sha256(bank / "bank_config.json")):
         raise ValueError("Retrieval index does not match source configuration/split")
-    for item in tqdm(info["files"].values(), desc="驗證 bank 檔案", unit="file", dynamic_ncols=True):
-        if sha256(item["path"]) != item["sha256"]:
+    for key, item in info["files"].items():
+        if sha256(item["path"], f"驗證 bank：{key}") != item["sha256"]:
             raise ValueError(f"Retrieval index changed: {item['path']}")
     rows = read_json(info["files"]["sources"]["path"])
     expected = load_bank_rows(plan, bank)

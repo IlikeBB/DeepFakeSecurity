@@ -30,11 +30,75 @@ def save_array(path, value):
     temporary.replace(path)
 
 
-def sha256(path):
+def save_concatenated_array(path, values, desc):
+    """Atomically concatenate arrays on disk while reporting written rows."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    if not values:
+        raise ValueError(f"Cannot concatenate an empty array list: {path}")
+    first = values[0]
+    shape = first.shape[1:]
+    dtype = first.dtype
+    if any(value.shape[1:] != shape or value.dtype != dtype for value in values):
+        raise ValueError(f"Cannot concatenate arrays with different shapes or dtypes: {path}")
+    total = sum(len(value) for value in values)
+    if not total:
+        raise ValueError(f"Cannot save an empty concatenated array: {path}")
+    temporary.unlink(missing_ok=True)
+    mapped = None
+    try:
+        mapped = np.lib.format.open_memmap(
+            temporary, mode="w+", dtype=dtype, shape=(total, *shape))
+        offset = 0
+        with tqdm(total=total, desc=desc, unit="patch", unit_scale=True,
+                  dynamic_ncols=True) as progress:
+            for value in values:
+                end = offset + len(value)
+                mapped[offset:end] = value
+                offset = end
+                progress.update(len(value))
+        mapped.flush()
+        del mapped
+        mapped = None
+        temporary.replace(path)
+    except BaseException:
+        if mapped is not None:
+            del mapped
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def write_json_list(path, values, desc, unit="row"):
+    """Atomically stream a large JSON list while reporting completed items."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as file:
+            file.write("[\n")
+            for index, value in enumerate(tqdm(values, total=len(values), desc=desc, unit=unit,
+                                               dynamic_ncols=True)):
+                if index:
+                    file.write(",\n")
+                rendered = json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False)
+                file.write("  " + rendered.replace("\n", "\n  "))
+            file.write("\n]")
+        temporary.replace(path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def sha256(path, desc=None):
+    path = Path(path)
     digest = hashlib.sha256()
-    with Path(path).open("rb") as file:
+    with path.open("rb") as file, tqdm(
+            total=path.stat().st_size, desc=desc, unit="B", unit_scale=True,
+            unit_divisor=1024, dynamic_ncols=True, disable=desc is None) as progress:
         for chunk in iter(lambda: file.read(8 * 1024 * 1024), b""):
             digest.update(chunk)
+            progress.update(len(chunk))
     return digest.hexdigest()
 
 

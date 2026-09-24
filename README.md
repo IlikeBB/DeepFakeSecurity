@@ -223,6 +223,10 @@ Stage 1 依序完成：
    exact NN bank；每張增強視圖以固定 seed 抽取 25% 前景 patch，避免 bank 超過單張 GPU 顯存。
 7. 保存原始來源、增強參數、影像／設定雜湊與 patch 空間位置，再寫入完成紀錄。
 
+索引掃描完成後，終端會繼續顯示 `寫入 features`、`origins`、`patch_ids`、`sources`
+及各檔案 `SHA-256` 的進度。大型陣列採分段 memory-map 寫入，不需要先在 RAM 中建立第二份
+完整索引；看到 `retrieval.json` 後 Stage 1 才算正式完成。
+
 增強後的完整 token grid 也會納入 only-real reconstruction 與 RealPatchBank fitting，且沿用原圖
 `group_id`，所以原圖與其增強版本一定落在相同 family partition。這些資料只擴充正常訓練分布，
 不會進入 calibration 或 evaluation。預設每張 real 一個增強視圖；若修改任何增強參數，必須使用
