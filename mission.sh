@@ -33,7 +33,7 @@ set -eo pipefail
 
 task="${1:-crop-face}"
 case "$task" in
-  stage1|stage2|ablation|all|patch-mil|real-patch-bank|patch-reconstruction) if (($#)); then shift; fi ;;
+  stage1|stage2|ablation|all|patch-mil|real-patch-bank|patch-reconstruction|qwen-explanation) if (($#)); then shift; fi ;;
   crop-face|segment-face) if (($#)); then shift; fi ;;
   --help|-h)
     cat <<'HELP'
@@ -46,6 +46,7 @@ case "$task" in
   bash mission.sh ablation [參數]   # 固定檢索消融
   bash mission.sh real-patch-bank [參數] # 純 real patch 統計模型
   bash mission.sh patch-reconstruction [參數] # only-real 局部特徵重建
+  bash mission.sh qwen-explanation [參數] # 本機 Qwen3-VL 證據文字改寫
   bash mission.sh patch-mil [參數]       # supervised patch-level 真偽分類器
 
 RetinaFace 多 GPU：--gpus 4,5,6（逗號分隔，每張 GPU 一個程序）
@@ -79,6 +80,9 @@ if [[ "$task" == patch-mil ]]; then
 fi
 if [[ "$task" == patch-reconstruction ]]; then
   exec python -u main.py --task patch-reconstruction "$@"
+fi
+if [[ "$task" == qwen-explanation ]]; then
+  exec python -u main.py --task qwen-explanation "$@"
 fi
 if [[ "$task" == real-patch-bank ]]; then
   exec python -u main.py --task real-patch-bank "$@"

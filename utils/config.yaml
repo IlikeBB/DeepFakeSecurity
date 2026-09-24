@@ -239,3 +239,11 @@ patch_reconstruction:
   max_train_images: 0
   max_validation_images: 0
   seed: 42
+
+# 僅改寫 Stage 2 已校準的結構化證據，不參與分數、門檻、預測或區域定位。
+qwen_explanation:
+  model_path: /ssd8/chihyu/LLM/Qwen3-VL-8B-Instruct
+  device: cuda:0
+  max_items: 32  # 固定順序、類別平衡且每影片最多一張；0 表示全部
+  max_new_tokens: 128
+  overwrite: false

@@ -560,3 +560,30 @@ conda run --no-capture-output -n pt230 python -m script.reconstruction_external 
 步驟 1 的正式結果包含 NN、純重建、影像層融合、影像／影片指標、三種 patch
 證據熱圖與中文說明。步驟 3 是 reconstruction-only 跨資料集結果，因為不建立
 Celeb-DF normal bank；這可避免使用外部測試資料形成參考庫而污染測試協定。
+
+#### 本機 Qwen3-VL 自然語言說明（不參與判定）
+
+本機模型固定使用 `/ssd8/chihyu/LLM/Qwen3-VL-8B-Instruct`。語言模型只讀取
+`explanations.json` 內已經由 real calibration 決定的預測、位置及證據來源，並改寫
+證據描述；它不能改變分數、門檻、預測或區域。輸出同時保存原始模板文字、Qwen
+文字、原始模型回覆與 grounding 檢查結果。若 Qwen 加入未提供的位置、數字、真假
+判定或眼鼻口名稱，該筆會標為 `fallback` 並改用確定性模板。
+
+模型約有 17 GB 權重，所以這是和 Stage 2 分離的離線步驟。預設按固定資料順序選
+32 張，real/fake 各半且每支影片最多一張；這只影響展示案例，不影響任何評估指標。
+
+```bash
+# DFDC：完成 patch-reconstruction evaluate 後執行。
+bash mission.sh qwen-explanation \
+  --input outputs/patch_reconstruction/SEGFACE_FROZEN_NN_DEDUP_V2/local_transformer_v2/stage2/explanations.json \
+  --device cuda:0
+
+# Celeb-DF：完成 reconstruction_external evaluate 後執行。
+bash mission.sh qwen-explanation \
+  --input /ssd8/chihyu/Dataset/DeepFake_Dataset/Celeb-df-external/results/local_transformer_v2/explanations.json \
+  --device cuda:0
+
+# 需要處理全部影像時才使用；輸出預設放在輸入檔旁的 qwen_explanations.json。
+# 加 --overwrite 才會覆蓋既有輸出。
+bash mission.sh qwen-explanation --input <explanations.json> --max-items 0 --device cuda:0
+```
