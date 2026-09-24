@@ -203,7 +203,7 @@ crop_face:
   label_csv: /ssd2/DeepFakes/DFDC_list/test.csv  # null 時使用 Celeb-DF 官方切分
   split: test
   output_dir: /ssd8/chihyu/Dataset/DeepFake_Dataset/DFDC
-  cache_dir: outputs/retinaface_cache  # 首次執行自動下載 RetinaFace 權重
+  cache_dir: outputs/cache/retinaface  # 首次執行自動下載 RetinaFace 權重
   device: cpu  # cpu 或 cuda:0；多個工作會共用指定的 GPU
   gpu_ids: [5]  # 目前預設使用 GPU 5；執行前可依當下負載調整
   workers: 8  # CPU／單 GPU 的程序數；gpu_ids 非空時固定每張 GPU 一個程序
