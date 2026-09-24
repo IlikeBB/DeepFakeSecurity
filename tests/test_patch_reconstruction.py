@@ -2,7 +2,7 @@ import unittest
 import numpy as np
 import torch
 from models.patch_reconstruction import PatchReconstruction
-from script.patch_reconstruction import normalized_fusion, epoch
+from script.patch_reconstruction import aggregate_videos, balanced_heatmap_rows, normalized_fusion, epoch
 from script.real_patch_bank import _split_real_rows
 
 
@@ -55,6 +55,24 @@ class ReconstructionTests(unittest.TestCase):
         self.assertFalse({r['group_id'] for r in fit} & {r['group_id'] for r in val})
         with self.assertRaises(ValueError):
             _split_real_rows(rows + [dict(label=1, group_id='fake')], .2, 42)
+
+    def test_video_aggregation_and_balanced_heatmaps(self):
+        rows = [
+            dict(video_id='real-a', label=0, score=1., reconstruction=2., sample_id=0),
+            dict(video_id='real-a', label=0, score=3., reconstruction=4., sample_id=1),
+            dict(video_id='real-b', label=0, score=5., reconstruction=6., sample_id=2),
+            dict(video_id='fake-a', label=1, score=7., reconstruction=8., sample_id=3),
+            dict(video_id='fake-b', label=1, score=9., reconstruction=10., sample_id=4),
+        ]
+        videos = aggregate_videos(rows, ['score', 'reconstruction'])
+        self.assertEqual(videos[0], dict(video_id='real-a', label=0, frames=2,
+                                         score=2., reconstruction=3.))
+        selected = balanced_heatmap_rows(rows, 4)
+        self.assertEqual([row['video_id'] for row in selected],
+                         ['real-a', 'real-b', 'fake-a', 'fake-b'])
+        bad = rows + [dict(video_id='real-a', label=1, score=1., reconstruction=1.)]
+        with self.assertRaisesRegex(ValueError, 'Conflicting labels'):
+            aggregate_videos(bad, ['score'])
 
     def test_train_reload_evaluate_and_heatmap(self):
         import tempfile

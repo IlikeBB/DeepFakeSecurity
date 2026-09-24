@@ -34,3 +34,37 @@ def save_heatmap(row, destination):
     destination.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(destination, dpi=130)
     figure.clear()
+
+
+def save_evidence_heatmap(row, maps, destination):
+    """Render NN, reconstruction, and fused calibration-relative evidence."""
+    with Image.open(row['image_path']) as image:
+        face = np.asarray(image.convert('RGB'))
+    height, width = face.shape[:2]
+    figure = Figure(figsize=(13, 4), constrained_layout=True)
+    FigureCanvasAgg(figure)
+    axes = figure.subplots(1, 4)
+    norm = PowerNorm(gamma=.5, vmin=0, vmax=2)
+    axes[0].imshow(face)
+    axes[0].set_title('SegFace crop')
+    nearest = maps.get('nearest')
+    if nearest is None:
+        axes[1].text(.5, .5, 'No external NN bank', ha='center', va='center')
+    else:
+        axes[1].imshow(nearest, norm=norm, cmap='inferno', interpolation='nearest')
+    axes[1].set_title('Normal-bank evidence')
+    axes[2].imshow(maps['reconstruction'], norm=norm, cmap='inferno', interpolation='nearest')
+    axes[2].set_title('Neighbor prediction evidence')
+    axes[3].imshow(face)
+    overlay = axes[3].imshow(maps['fusion'], norm=norm, cmap='inferno', alpha=.55,
+                             extent=(0, width, height, 0), interpolation='nearest')
+    axes[3].set_title('Fused evidence overlay')
+    for axis in axes:
+        axis.axis('off')
+    figure.colorbar(overlay, ax=list(axes), shrink=.8,
+                    label='Calibration-relative evidence (1 ≈ real-patch q99)')
+    figure.suptitle(Path(row['image_path']).name)
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(destination, dpi=130)
+    figure.clear()

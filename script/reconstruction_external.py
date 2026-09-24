@@ -23,9 +23,11 @@ from script.bank_export import load_feature
 from script.face_parser import SegFaceParser
 from script.face_crop import expand_mask, crop_masked_face
 from script.segment_face import save_image
-from script.patch_reconstruction import score
+from script.patch_explanation import (evidence_maps, explain, fit_patch_normalization,
+                                      patch_fusion_score)
+from script.patch_reconstruction import balanced_heatmap_rows, score
 from script.real_patch_bank import _foreground_mask
-from script.reconstruction_heatmap import save_heatmap
+from script.reconstruction_heatmap import save_evidence_heatmap
 from script.retrieval_io import experiment_lock, metrics
 
 
@@ -271,8 +273,29 @@ def evaluate(args):
     videos = video_rows(scored)
     video_threshold = float(np.quantile([r['score'] for r in video_rows(calibration)], config.threshold_quantile))
     result = args.output / 'results' / source.name
-    write_json(result / 'evaluation_scores.json', scored)
     write_json(result / 'video_scores.json', videos)
+    patch_normalization = fit_patch_normalization(
+        calibration, None, config.threshold_quantile, config.boundary_weight)
+    for row in calibration:
+        maps = evidence_maps(row, None, patch_normalization, 0., config.boundary_weight)
+        row['patch_fusion'] = patch_fusion_score(maps, config.top_fraction)
+    patch_fusion_threshold = float(np.quantile(
+        [row['patch_fusion'] for row in calibration], config.threshold_quantile))
+    selected = balanced_heatmap_rows(scored, args.heatmap_count)
+    selected_paths = {row['image_path'] for row in selected}
+    explanations, heatmaps = [], {}
+    for row in scored:
+        maps = evidence_maps(row, None, patch_normalization, 0., config.boundary_weight)
+        row['patch_fusion'] = patch_fusion_score(maps, config.top_fraction)
+        row['patch_fusion_prediction'] = ('anomaly' if row['patch_fusion'] > patch_fusion_threshold
+                                          else 'normal')
+        explanations.append(explain(dict(row, score=row['patch_fusion']), maps,
+                                    patch_fusion_threshold, config.top_fraction))
+        if row['image_path'] in selected_paths:
+            heatmaps[row['image_path']] = maps
+    explanation_path = result / 'explanations.json'
+    write_json(explanation_path, explanations)
+    write_json(result / 'evaluation_scores.json', scored)
     report = dict(protocol='DFDC-only training/validation/calibration -> Celeb-DF official test',
                   method='reconstruction-only (no external NN fusion)',
                   source_run=str(source), checkpoint_sha256=meta['checkpoint_sha256'],
@@ -281,17 +304,19 @@ def evaluate(args):
                   image=metrics(scored, threshold), video_mean=metrics(videos, video_threshold),
                   coverage=read_json(args.output / 'coverage.json'),
                   source_image_reconstruction=source_report['components']['reconstruction'],
-                  threshold_source='DFDC calibration real q99; video threshold uses per-video mean scores')
+                  patch_fusion=metrics(
+                      [dict(label=row['label'], score=row['patch_fusion']) for row in scored],
+                      patch_fusion_threshold),
+                  threshold_source='DFDC calibration real q99; video threshold uses per-video mean scores',
+                  patch_explanations=dict(path=str(explanation_path.resolve()), count=len(explanations),
+                      patch_normalization=patch_normalization,
+                      language='zh-TW deterministic template grounded in reconstruction evidence',
+                      prediction_method='mean of highest reconstruction-evidence patches',
+                      limitation='Feature evidence, not pixel-level forgery ground truth.'))
     write_json(result / 'metrics.json', report)
-    # Deterministic examples spread across classes, not selected by anomaly score.
-    for label in (0, 1):
-        first_frames = {}
-        for row in scored:
-            if row['label'] == label:
-                first_frames.setdefault(row['video_id'], row)
-        examples = list(first_frames.values())[:args.heatmap_count // 2]
-        for row in examples:
-            save_heatmap(row, result / 'heatmaps' / f"{row['sample_id']:08d}.png")
+    for row in selected:
+        save_evidence_heatmap(row, heatmaps[row['image_path']],
+                              result / 'heatmaps' / f"{row['sample_id']:08d}.png")
     print({key: report[key] for key in ('image', 'video_mean')}, flush=True)
 
 
@@ -302,7 +327,7 @@ def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--stage', choices=['segment', 'prepare', 'evaluate', 'all'], default='segment')
     p.add_argument('--bank', type=Path, default=project / 'RAG/normal/SEGFACE_FROZEN_NN_DEDUP_V2')
-    p.add_argument('--source-run', type=Path, default=project / 'outputs/patch_reconstruction/SEGFACE_FROZEN_NN_DEDUP_V2/local_transformer_v1')
+    p.add_argument('--source-run', type=Path, default=project / 'outputs/patch_reconstruction/SEGFACE_FROZEN_NN_DEDUP_V2/local_transformer_v2')
     p.add_argument('--data-root', type=Path, default=Path('/ssd2/DeepFakes/celeb-df-video'))
     p.add_argument('--crops', type=Path, default=Path('/ssd8/chihyu/Dataset/DeepFake_Dataset/Celeb-df-Frame-Face'))
     p.add_argument('--output', type=Path, default=Path('/ssd8/chihyu/Dataset/DeepFake_Dataset/Celeb-df-external'))

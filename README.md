@@ -432,12 +432,15 @@ bash run.sh --help
 `score = 0.5 * normalized_NN + 0.5 * normalized_reconstruction`。
 融合後再以 calibration real q99 設門檻，預測使用嚴格 `score > threshold`。
 權重在訓練前宣告，不能依 evaluation fake 調整。`--nn-weight 0` 可測純重建，
-這時不需要 NN Stage 2 結果。這不是 patch 級 NN 距離融合。
+這時不需要 NN Stage 2 結果。另回報的 `patch_fusion` 會先在相同位置融合
+calibration-normalized NN／重建 patch 證據，再平均最高 10%；它的門檻同樣只由
+calibration real 設定，並直接驅動融合熱圖與自然語言說明。兩種融合皆固定回報，
+不能看 evaluation fake 結果後選擇其中一種作為主要結果。
 
 ```bash
 # 預先完成同一實驗的原 NN Stage 2，再執行重建訓練與完整評估。
 bash mission.sh patch-reconstruction --stage all \
-  --exper SEGFACE_FROZEN_NN_DEDUP_V2 --run-name local_transformer_v1 --device cuda:0
+  --exper SEGFACE_FROZEN_NN_DEDUP_V2 --run-name local_transformer_v2 --device cuda:0
 
 # 若只先訓練：--stage train；之後同 run-name 使用 --stage evaluate。
 # 純重建消融（獨立 run，訓練與評估都要指定同一權重）
@@ -450,8 +453,24 @@ bash mission.sh patch-reconstruction --stage all \
 `model.safetensors`、`training.json`（設定、來源 hash、family 分組、loss history），
 `stage2/metrics.json`（融合及各分量 AUROC/AP/FPR/TPR、校準參數），以及
 calibration/evaluation scores（含 patch IDs、原始重建 error、有效 patch 數），
-以及 `stage2/heatmaps/` 的固定 0–2 cosine-error 色階圖；熱圖不是偽造機率或
+以及 `stage2/heatmaps/` 的固定 0–2 calibration-relative evidence 色階圖；熱圖不是偽造機率或
 像素級 ground-truth 定位評估。`--heatmap-count 0` 可關閉 PNG 匯出。
+`stage2/video_scores.json` 與 `metrics.json` 的 `video_mean`／`video_components`
+另外回報逐影片平均分數；影片門檻只由 calibration real 的逐影片平均 q99 決定。
+熱圖以固定資料順序抽取、real/fake 各半且每支影片最多一張，不依異常分數挑圖。
+每張 evaluation 影像另輸出 `stage2/explanations.json`。解釋層會讀取同位置的
+NN distance map 與 reconstruction-error map，只用 calibration real patch 的 median
+與 q99 對齊尺度，再找出融合證據最高 10% patch 的相連區域。文字說明包含：
+
+- 是否超過只用 real 設定的影像門檻；
+- 較高證據位於臉部上／中／下、左／中／右哪個位置；
+- 該區域主要來自「偏離正常特徵庫」、「無法由鄰近 patch 預測」或兩者共同；
+- 固定聲明這是 feature evidence，不是像素級偽造 ground truth。
+
+文字由固定模板與實際數值產生，不呼叫 LLM，也不生成資料中沒有的臉部語意。
+左右位置指影像座標；在沒有 landmark 驗證時，不直接聲稱是眼睛、鼻子或嘴巴。
+內部熱圖同時顯示 normal-bank、neighbor-prediction 與 fused evidence；色階中的 1
+約等於 calibration real patch 的 q99。
 模型既有時不覆蓋，請改用新 run-name。預設單 GPU；`--device cpu` 也可執行。
 
 **研究限制**：cached DINO token 已經由 self-attention 混合全圖資訊。
@@ -463,7 +482,8 @@ calibration/evaluation scores（含 patch IDs、原始重建 error、有效 patc
 
 #### DFDC → Celeb-DF 外部測試（strict source-only protocol）
 
-目前依使用者要求只執行 Celeb-DF 資料前處理，模型訓練與後續評估已暫停。
+Celeb-DF 資料前處理已完成。正式模型使用新的 `local_transformer_v2` 從頭訓練；
+先前中止的 `local_transformer_v1` 不續訓，也不作為正式評估 checkpoint。
 預設 `script.reconstruction_external` 的 stage 為 `segment`：只做 SegFace、標籤與資料清單，
 不抽 DINO 特徵、不訓練、不評估。資料清單為 `data_manifest.json`，統計為 `data_summary.json`。
 專用入口：`bash mission_Celeb-df.sh all`，只依序裁切與分割。
@@ -479,7 +499,7 @@ conda run --no-capture-output -n pt230 python -m script.reconstruction_external 
   --stage segment --device cuda:3
 ```
 
-以下模型與完整評估命令保留供後續確認後使用。
+以下模型與完整評估命令用於正式 only-real reconstruction 實驗。
 
 目前採 DFDC real 訓練、DFDC held-out real 選模、DFDC calibration real 設門檻；
 **Celeb-DF 只讀取官方測試清單的 518 支影片**，每支最多 32 幀，不把其 real 用於
@@ -500,10 +520,10 @@ conda run --no-capture-output -n pt230 python -m script.reconstruction_external 
 # 3. DFDC Transformer 的訓練及 Stage 2 評估都完成後執行。
 conda run --no-capture-output -n pt230 python -m script.reconstruction_external \
   --stage evaluate --device cuda:3 \
-  --source-run outputs/patch_reconstruction/SEGFACE_FROZEN_NN_DEDUP_V2/local_transformer_v1
+  --source-run outputs/patch_reconstruction/SEGFACE_FROZEN_NN_DEDUP_V2/local_transformer_v2
 ```
 
-外部輸出：`/ssd8/chihyu/Dataset/DeepFake_Dataset/Celeb-df-external/results/local_transformer_v1/metrics.json`。
+外部輸出：`/ssd8/chihyu/Dataset/DeepFake_Dataset/Celeb-df-external/results/local_transformer_v2/metrics.json`。
 這裡評估**純重建分數**，並與 DFDC 的純重建分量比較；沒有暗中換成 Celeb-DF
 自己的 NN bank。影像分數沿用 DFDC real 校準影像 q99；影片分數為影像分數平均，
 影片門檻另以 DFDC calibration real 的「每影片平均」q99 決定。
@@ -516,3 +536,27 @@ hash、來源 split hash、RetinaFace 設定、SegFace 設定與權重 hash，�
 人物完全互斥，也不保證不存在近重複畫面**。前景／臉部偵測失敗不應被默默當作
 成功辨識；請一併查看 `coverage.json`。外部 PNG 依固定順序、每影片一幀抽樣，
 real/fake 各一半；沒有使用分數挑選看起來最成功的案例。
+
+#### 正式實驗啟動順序
+
+```bash
+cd /ssd8/chihyu/Project/DeepFakeSecurity
+
+# 1. 從頭訓練 only-real decoder，並完成 DFDC calibration / evaluation。
+bash mission.sh patch-reconstruction --stage all \
+  --exper SEGFACE_FROZEN_NN_DEDUP_V2 \
+  --run-name local_transformer_v2 --device cuda:0
+
+# 2. 建立或核對 Celeb-DF frozen DINO cache；metadata 一致時直接重用。
+conda run --no-capture-output -n pt230 python -m script.reconstruction_external \
+  --stage prepare --device cuda:3
+
+# 3. 使用 DFDC checkpoint 與 DFDC real q99 門檻直接測 Celeb-DF。
+conda run --no-capture-output -n pt230 python -m script.reconstruction_external \
+  --stage evaluate --device cuda:3 \
+  --source-run outputs/patch_reconstruction/SEGFACE_FROZEN_NN_DEDUP_V2/local_transformer_v2
+```
+
+步驟 1 的正式結果包含 NN、純重建、影像層融合、影像／影片指標、三種 patch
+證據熱圖與中文說明。步驟 3 是 reconstruction-only 跨資料集結果，因為不建立
+Celeb-DF normal bank；這可避免使用外部測試資料形成參考庫而污染測試協定。

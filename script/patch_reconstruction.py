@@ -1,5 +1,6 @@
 """Only-real center-blind reconstruction with optional calibrated NN score fusion."""
 import argparse
+from collections import defaultdict
 from pathlib import Path
 import random
 
@@ -13,9 +14,11 @@ import yaml
 from models.patch_reconstruction import PatchReconstruction
 from script.bank_data import image_records, read_json, sha256, write_json
 from script.bank_retrieval import aggregate_patch_score
+from script.patch_explanation import (evidence_maps, explain, fit_patch_normalization,
+                                      nearest_lookup, patch_fusion_score)
 from script.real_patch_bank import _load_observation, _split_real_rows, _source_spec, ensure_cache
 from script.retrieval_io import experiment_lock, metrics
-from script.reconstruction_heatmap import save_heatmap
+from script.reconstruction_heatmap import save_evidence_heatmap
 
 
 class Features(Dataset):
@@ -100,16 +103,47 @@ def score(model, rows, bank, args):
 
 def attach_nearest(scored, path):
     baseline = read_json(path)
-    lookup = {row['image_path']: row for row in baseline}
-    if len(lookup) != len(baseline) or set(lookup) != {r['image_path'] for r in scored}:
-        raise ValueError('NN and reconstruction image sets differ')
+    lookup = nearest_lookup(baseline, scored)
     for row in scored:
         other = lookup[row['image_path']]
-        if any(row[k] != other[k] for k in ('label', 'group_id', 'video_id')):
-            raise ValueError('NN split metadata mismatch')
         if not np.isfinite(other['score']):
             raise ValueError('Invalid NN score')
         row['nearest'] = float(other['score'])
+    return lookup
+
+
+def aggregate_videos(rows, fields):
+    """Average frame scores per video while preserving all requested components."""
+    grouped = defaultdict(list)
+    for row in rows:
+        grouped[row['video_id']].append(row)
+    result = []
+    for video_id, frames in grouped.items():
+        labels = {row['label'] for row in frames}
+        if len(labels) != 1:
+            raise ValueError(f'Conflicting labels within video: {video_id}')
+        item = {'video_id': video_id, 'label': labels.pop(), 'frames': len(frames)}
+        for field in fields:
+            values = [row[field] for row in frames]
+            if not all(np.isfinite(values)):
+                raise ValueError(f'Non-finite {field} within video: {video_id}')
+            item[field] = float(np.mean(values))
+        result.append(item)
+    return result
+
+
+def balanced_heatmap_rows(rows, count):
+    """Select fixed-order, one-frame-per-video examples without score cherry-picking."""
+    selected = []
+    quotas = {0: (count + 1) // 2, 1: count // 2}
+    seen = set()
+    for row in rows:
+        label = row['label']
+        if quotas.get(label, 0) and row['video_id'] not in seen:
+            selected.append(row)
+            seen.add(row['video_id'])
+            quotas[label] -= 1
+    return selected
 
 
 def parse_args(argv=None):
@@ -117,7 +151,7 @@ def parse_args(argv=None):
     config = yaml.safe_load((root / 'utils/config.yaml').read_text())['patch_reconstruction']
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--exper', required=True, dest='experiment')
-    p.add_argument('--run-name', default='local_transformer_v1')
+    p.add_argument('--run-name', default='local_transformer_v2')
     p.add_argument('--stage', choices=['train', 'evaluate', 'all'], default='train')
     p.add_argument('--device', default='cuda:0')
     for name in ('epochs', 'batch-size', 'workers', 'patience', 'max-train-images', 'max-validation-images', 'heatmap-count'):
@@ -211,6 +245,7 @@ def main(argv=None):
             calibration = score(model, calibration_rows, bank, args)
             evaluation = score(model, image_records(plan['groups']['evaluation'], 'evaluation'), bank, args)
             nearest_hashes = {}
+            nearest_lookups = {}
             if args.nn_weight > 0:
                 source_stage1 = Path(args.source_results_dir) / args.experiment / 'stage1'
                 if (read_json(source_stage1 / 'config.json') != _source_spec(bank)
@@ -218,7 +253,7 @@ def main(argv=None):
                     raise ValueError('NN source configuration or split differs from reconstruction')
                 for role, scored in [('calibration', calibration), ('evaluation', evaluation)]:
                     path = Path(args.source_results_dir) / args.experiment / 'stage2' / f'{role}_scores.json'
-                    attach_nearest(scored, path)
+                    nearest_lookups[role] = attach_nearest(scored, path)
                     nearest_hashes[role] = sha256(path)
             stats, threshold = normalized_fusion(calibration, evaluation, args.nn_weight, args.threshold_quantile)
             report = dict(image=metrics(evaluation, threshold), normalization=stats, nn_weight=args.nn_weight,
@@ -227,13 +262,69 @@ def main(argv=None):
             for name in stats:
                 cut = float(np.quantile([r[name] for r in calibration], args.threshold_quantile))
                 report['components'][name] = metrics([dict(label=r['label'], score=r[name]) for r in evaluation], cut)
+            fields = ['score', *stats]
+            calibration_videos = aggregate_videos(calibration, fields)
+            evaluation_videos = aggregate_videos(evaluation, fields)
+            video_threshold = float(np.quantile([r['score'] for r in calibration_videos], args.threshold_quantile))
+            report['video_mean'] = metrics(evaluation_videos, video_threshold)
+            report['video_components'] = {}
+            for name in stats:
+                cut = float(np.quantile([r[name] for r in calibration_videos], args.threshold_quantile))
+                report['video_components'][name] = metrics(
+                    [dict(label=r['label'], score=r[name]) for r in evaluation_videos], cut)
             for role, scored in [('calibration', calibration), ('evaluation', evaluation)]:
                 for row in scored:
                     row['prediction'] = 'anomaly' if row['score'] > threshold else 'normal'
-                write_json(output / 'stage2' / f'{role}_scores.json', scored)
+            for row in evaluation_videos:
+                row['prediction'] = 'anomaly' if row['score'] > video_threshold else 'normal'
+            write_json(output / 'stage2/video_scores.json', evaluation_videos)
+            patch_normalization = fit_patch_normalization(
+                calibration, nearest_lookups.get('calibration'), args.threshold_quantile,
+                args.boundary_weight)
+            for row in calibration:
+                nearest = (nearest_lookups['calibration'][row['image_path']]
+                           if 'calibration' in nearest_lookups else None)
+                maps = evidence_maps(row, nearest, patch_normalization,
+                                     args.nn_weight, args.boundary_weight)
+                row['patch_fusion'] = patch_fusion_score(maps, args.top_fraction)
+            patch_fusion_threshold = float(np.quantile(
+                [row['patch_fusion'] for row in calibration], args.threshold_quantile))
+            selected = balanced_heatmap_rows(evaluation, args.heatmap_count)
+            selected_paths = {row['image_path'] for row in selected}
+            explanations = []
+            heatmaps = {}
+            for row in evaluation:
+                nearest = (nearest_lookups['evaluation'][row['image_path']]
+                           if 'evaluation' in nearest_lookups else None)
+                maps = evidence_maps(row, nearest, patch_normalization,
+                                     args.nn_weight, args.boundary_weight)
+                row['patch_fusion'] = patch_fusion_score(maps, args.top_fraction)
+                row['patch_fusion_prediction'] = ('anomaly' if row['patch_fusion'] > patch_fusion_threshold
+                                                  else 'normal')
+                explanation_row = dict(row, score=row['patch_fusion'])
+                explanations.append(explain(explanation_row, maps, patch_fusion_threshold,
+                                            args.top_fraction))
+                if row['image_path'] in selected_paths:
+                    heatmaps[row['image_path']] = maps
+            explanation_path = output / 'stage2/explanations.json'
+            write_json(explanation_path, explanations)
+            write_json(output / 'stage2/calibration_scores.json', calibration)
+            write_json(output / 'stage2/evaluation_scores.json', evaluation)
+            report['patch_fusion'] = metrics(
+                [dict(label=row['label'], score=row['patch_fusion']) for row in evaluation],
+                patch_fusion_threshold)
+            report['patch_explanations'] = {
+                'path': str(explanation_path.resolve()),
+                'count': len(explanations),
+                'patch_normalization': patch_normalization,
+                'language': 'zh-TW deterministic template grounded in calibrated patch evidence',
+                'prediction_method': 'mean of highest fused patch evidence; same evidence used by heatmap',
+                'limitation': 'Feature evidence, not pixel-level forgery ground truth.',
+            }
             write_json(output / 'stage2/metrics.json', report)
-            for row in evaluation[:args.heatmap_count]:
-                save_heatmap(row, output / 'stage2/heatmaps' / f"{row['sample_id']:08d}.png")
+            for row in selected:
+                save_evidence_heatmap(row, heatmaps[row['image_path']],
+                                      output / 'stage2/heatmaps' / f"{row['sample_id']:08d}.png")
             print(report['image'], flush=True)
 
 
