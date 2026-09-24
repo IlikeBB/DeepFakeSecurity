@@ -38,6 +38,17 @@ retrieval:
   method: nearest  # 主基準：完整 real bank 全域 cosine 1-NN
   deduplicate_content: true  # 切分前合併 JPEG 內容重複的來源家族及其 fake 衍生
   boundary_weight: 0.5  # 遮罩邊界 patch 降權；1.0 為未加權基準，僅在 validation 比較
+  bank_augmentation:
+    enabled: true  # 只增強 bank real；calibration、evaluation 與 fake 維持原圖
+    views_per_image: 1  # 每張 real 產生一個同時包含下列四類變化的視圖
+    seed: 31415  # 參數由來源影像與 view 編號決定，不受 worker 數量影響
+    brightness: [0.85, 1.15]
+    noise_std: [0.005, 0.02]  # 相對 0-1 像素尺度，且只加在 SegFace 前景
+    rotation_degrees: [2.0, 7.0]
+    scale: [0.97, 1.03]
+    shear_degrees: 2.0
+    translate_fraction: 0.02
+    bank_patch_fraction: 0.25  # augmented view 固定抽 25% 前景 patch 進 exact NN 索引
   encoder_tuning:
     enabled: false  # 先固定 encoder 驗證切分與評分；LoRA 留待獨立消融
     rank: 8
@@ -173,7 +184,7 @@ mission:
 
 # 對 RetinaFace 輸出做語意臉部分割、遮罩擴張與去背景裁切。
 segment_face:
-  input_dir: /ssd8/chihyu/Dataset/DeepFake_Dataset/DFDC
+  input_dir: /ssd8/chihyu/Dataset/DeepFake_Dataset/DFDC-Frame-Face
   normal_output_dir: /ssd8/chihyu/Dataset/DeepFake_Dataset/DFDC-SegFace-normal
   anomaly_output_dir: /ssd8/chihyu/Dataset/DeepFake_Dataset/DFDC-SegFace-anomaly
   parser_model: SegFace-SwinB-CelebAMaskHQ-512
@@ -202,7 +213,7 @@ crop_face:
   data_root: /ssd2/DeepFakes/deepFakeChallenge
   label_csv: /ssd2/DeepFakes/DFDC_list/test.csv  # null 時使用 Celeb-DF 官方切分
   split: test
-  output_dir: /ssd8/chihyu/Dataset/DeepFake_Dataset/DFDC
+  output_dir: /ssd8/chihyu/Dataset/DeepFake_Dataset/DFDC-Frame-Face
   cache_dir: outputs/cache/retinaface  # 首次執行自動下載 RetinaFace 權重
   device: cpu  # cpu 或 cuda:0；多個工作會共用指定的 GPU
   gpu_ids: [5]  # 目前預設使用 GPU 5；執行前可依當下負載調整

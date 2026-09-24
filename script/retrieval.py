@@ -8,6 +8,7 @@ import torch
 from threadpoolctl import threadpool_limits
 import yaml
 
+from script.bank_augmentation import prepare_bank_rows, validate_augmentation_config
 from script.bank_data import prepare_plan, read_json, sha256, write_json
 from script.bank_retrieval import build, evaluate, load_index
 from script.retrieval_io import ensure_experiment_config, experiment_lock, extract_roles
@@ -87,6 +88,10 @@ def parse_args(argv=None):
             or not math.isfinite(ablation["boundary_weight"])
             or not 0 <= ablation["boundary_weight"] <= 1):
         parser.error("Invalid retrieval.ablation configuration")
+    try:
+        validate_augmentation_config(args.bank_augmentation)
+    except ValueError as error:
+        parser.error(str(error))
     tuning = args.encoder_tuning
     compression = tuning.get("compression", {})
     local = tuning.get("local_anomaly", {})
@@ -172,12 +177,14 @@ def main(argv=None):
                 from script.dino_lora import train_lora
 
                 train_lora(plan, args, bank, output)
+            bank_rows = prepare_bank_rows(plan, bank, args.bank_augmentation, args.workers)
             if not completion.exists():
-                extract_roles(plan, ("bank",), bank, cache, args)
+                extract_roles(plan, ("bank",), bank, cache, args,
+                              rows_by_role={"bank": bank_rows})
             if args.export_previews:
                 from script.bank_export import build_bank
                 build_bank(plan, args, bank)  # 選用：以既有 NPY 補齊 PCA／JPG 預覽，不影響索引。
-            build(plan, args, bank, output)
+            build(plan, args, bank, output, bank_rows)
             if args.method == "cross_attention":
                 from script.bank_attention import train_attention
                 _, sources, arrays = load_index(plan, bank, output)

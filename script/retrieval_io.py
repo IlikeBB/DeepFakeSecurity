@@ -83,9 +83,12 @@ def map_devices(function, items, devices):
     return [value for _, value in sorted(results)]
 
 
-def extract_roles(plan, roles, bank, cache, args):
+def extract_roles(plan, roles, bank, cache, args, rows_by_role=None):
+    rows_by_role = rows_by_role or {}
     jobs = [(bank if role == "bank" else cache / role, row)
-            for role in roles for row in image_records(plan["groups"][role], role)]
+            for role in roles
+            for row in (rows_by_role[role] if role in rows_by_role
+                        else image_records(plan["groups"][role], role))]
     devices = args.devices or ["cpu"]
     shards = [jobs[i::len(devices)] for i in range(len(devices))]
     model_lock = Lock()  # Transformers 初始化含全域狀態；序列化載入，推論仍平行。

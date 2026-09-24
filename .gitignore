@@ -8,8 +8,7 @@ models/real_patch_bank/*/
 __pycache__/
 *.pyc
 .env
-outputs/*
-!outputs/README.md
+outputs/
 RAG/general/*/
 RAG/normal/*/
 RAG/cache/*/

@@ -8,6 +8,7 @@ import numpy as np
 from PIL import Image
 from tqdm.auto import tqdm
 
+from script.bank_augmentation import load_bank_rows
 from script.bank_data import image_records, read_json, save_array, sha256, write_json
 from script.bank_search import PatchBank
 from script.retrieval_io import load_sample, map_devices, metrics
@@ -43,7 +44,18 @@ def aggregate_patch_score(distances, ids, grid, fraction, boundary_weight=1.):
     return float(np.sort(evidence)[-count:].mean())
 
 
-def build(plan, args, bank, output):
+def _bank_patch_subset(values, ids, row):
+    augmentation = row.get('augmentation')
+    if not augmentation:
+        return values, ids
+    fraction = augmentation['bank_patch_fraction']
+    count = max(1, math.ceil(len(ids) * fraction))
+    rng = np.random.default_rng(augmentation['parameters']['patch_seed'])
+    keep = np.sort(rng.choice(len(ids), count, replace=False))
+    return values[keep], ids[keep]
+
+
+def build(plan, args, bank, output, rows=None):
     stage1 = output / "stage1"
     stage1.mkdir(parents=True, exist_ok=True)
     completion = stage1 / "retrieval.json"
@@ -51,13 +63,15 @@ def build(plan, args, bank, output):
         load_index(plan, bank, output)
         print("Stage 1 已完成，沿用 real patch bank 索引。", flush=True)
         return
-    rows = image_records(plan["groups"]["bank"], "bank")
+    rows = rows if rows is not None else load_bank_rows(plan, bank)
     if not rows or any(row["label"] != 0 for row in rows):
         raise ValueError("Retrieval bank must contain real training images only")
 
     def read(row):
         _, features = load_sample(bank, row)
-        return foreground_patches(features, row["image_path"], args.foreground_minimum)
+        values, ids, grid = foreground_patches(features, row["image_path"], args.foreground_minimum)
+        values, ids = _bank_patch_subset(values, ids, row)
+        return values, ids, grid
 
     vectors, origins, patches = [], [], []
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
@@ -72,12 +86,22 @@ def build(plan, args, bank, output):
     directory.mkdir(parents=True, exist_ok=True)
     files = {"features": directory / "features.npy", "origins": directory / "origins.npy",
              "patch_ids": directory / "patch_ids.npy", "sources": stage1 / "sources.json"}
+    augmentation_manifest = bank / 'augmentations/manifest.json'
+    if augmentation_manifest.is_file():
+        files['augmentation_manifest'] = augmentation_manifest
     for key, values in (("features", vectors), ("origins", origins), ("patch_ids", patches)):
         save_array(files[key], np.concatenate(values))
     write_json(files["sources"], rows)
+    augmentation = getattr(args, 'bank_augmentation', {'enabled': False})
+    method = f"real {args.face_source} face patches; exact cosine 1-NN; weighted highest-distance patch mean"
+    if augmentation.get('enabled'):
+        method += '; original real patches + deterministic augmented-real patch subset'
     write_json(completion, {
-        "method": f"real {args.face_source} face patches; exact cosine 1-NN; weighted highest-distance patch mean",
+        "method": method,
         "image_count": len(rows), "patch_count": sum(len(values) for values in vectors),
+        "original_image_count": sum('augmentation' not in row for row in rows),
+        "augmented_image_count": sum('augmentation' in row for row in rows),
+        "augmentation": augmentation,
         "foreground_minimum": args.foreground_minimum, "top_fraction": args.top_fraction,
         "boundary_weight": getattr(args, "boundary_weight", 1.),
         "plan_sha256": sha256(bank / "splits.json"),
@@ -97,7 +121,7 @@ def load_index(plan, bank, output):
         if sha256(item["path"]) != item["sha256"]:
             raise ValueError(f"Retrieval index changed: {item['path']}")
     rows = read_json(info["files"]["sources"]["path"])
-    expected = image_records(plan["groups"]["bank"], "bank")
+    expected = load_bank_rows(plan, bank)
     if [{k: v for k, v in row.items() if k != "grid"} for row in rows] != expected:
         raise ValueError("Bank contains unexpected sources")
     arrays = {key: np.load(info["files"][key]["path"], mmap_mode="r", allow_pickle=False)
@@ -127,6 +151,9 @@ def match_image(features, image_path, search, info, sources, arrays, match_count
                         "distance": float(details["nearest_distances"][position] if details else distances[position]),
                         "anomaly_distance": float(distances[position]),
                         "weighted_evidence": float(evidence[position])})
+        if source.get('augmentation'):
+            matches[-1]['source_original_image'] = source['source_image_path']
+            matches[-1]['source_augmentation'] = source['augmentation']
         if details:
             matches[-1]["reference_patch_ids"] = details["candidate_ids"][position].tolist()
             matches[-1]["reference_weights"] = details["weights"][position].tolist()
@@ -221,9 +248,15 @@ def evaluate(plan, args, bank, cache, output):
             protocol="Development comparison on the existing evaluation split; not an untouched final test",
             methods=comparison, retrieval_sha256=sha256(output / "stage1/retrieval.json"),
             attention_sha256=sha256(output / "stage1/attention.json") if attention else None))
-    report = {"protocol": plan["protocol"], "method": info["method"] if method == "nearest" else method,
+    protocol = plan["protocol"]
+    if info.get('augmentation', {}).get('enabled'):
+        protocol += '; deterministic augmentation applied to bank real only'
+    report = {"protocol": protocol, "method": info["method"] if method == "nearest" else method,
               "boundary_weight": info.get("boundary_weight", 1.),
               "bank_images": info["image_count"], "bank_patches": info["patch_count"],
+              "bank_original_images": info.get("original_image_count", info["image_count"]),
+              "bank_augmented_images": info.get("augmented_image_count", 0),
+              "bank_augmentation": info.get("augmentation", {"enabled": False}),
               "image": metrics(tested, threshold), **({"comparison": comparison} if comparison else {})}
     write_json(stage2 / "metrics.json", report)
     result = report["image"]

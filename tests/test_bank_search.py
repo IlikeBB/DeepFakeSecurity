@@ -6,10 +6,24 @@ from unittest.mock import patch
 from types import SimpleNamespace
 
 from script.bank_search import PatchBank
-from script.bank_retrieval import match_image
+from script.bank_retrieval import _bank_patch_subset, match_image
 
 
 class PatchBankTests(unittest.TestCase):
+    def test_augmented_patch_subset_is_bounded_and_deterministic(self):
+        values = np.arange(40).reshape(10, 4)
+        ids = np.arange(10)
+        row = {'augmentation': {'bank_patch_fraction': .25,
+                                'parameters': {'patch_seed': 17}}}
+        first_values, first_ids = _bank_patch_subset(values, ids, row)
+        second_values, second_ids = _bank_patch_subset(values, ids, row)
+        self.assertEqual(len(first_ids), 3)
+        np.testing.assert_array_equal(first_ids, second_ids)
+        np.testing.assert_array_equal(first_values, values[first_ids])
+        original_values, original_ids = _bank_patch_subset(values, ids, {})
+        self.assertIs(original_values, values)
+        self.assertIs(original_ids, ids)
+
     def test_weighted_score_matches_explanations_and_preserves_raw_distances(self):
         distances = np.array([[.9, .1, .1, .1, .8, .1, .1, .1, .1]], dtype=np.float32)
         search = SimpleNamespace(score=lambda *args: (np.array([.9]), distances, np.zeros((1, 9), dtype=int)))

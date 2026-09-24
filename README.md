@@ -197,14 +197,16 @@ Stage 1 將 `bank` 中的 real 人臉轉成可搜尋的正常 patch 參考庫。
 
 ```mermaid
 flowchart LR
-    A["bank role<br/>real JPG"] --> B{"Encoder"}
+    A["bank role<br/>real JPG"] --> A2["固定 seed 正常增強<br/>光照／噪聲／旋轉／仿射"]
+    A --> B{"Encoder"}
+    A2 --> B
     B -->|--no-tune-encoder| C["Frozen DINOv3"]
     B -->|啟用 LoRA| D["訓練 LoRA<br/>載入最佳權重"]
     C --> E["提取 patch tokens"]
     D --> E
     E --> F["每張圖一個 float16 NPY<br/>目前 14 × 14 × 768"]
     F --> G["移除黑色背景 patch"]
-    G --> H["合併 real patches"]
+    G --> H["原圖全部 patch<br/>增強視圖固定抽樣 patch"]
     H --> I["features.npy<br/>origins.npy<br/>patch_ids.npy"]
     I --> J["retrieval.json<br/>設定與 SHA-256"]
 ```
@@ -212,11 +214,26 @@ flowchart LR
 Stage 1 依序完成：
 
 1. 合併 exact JPEG 重複 family 後建立 `splits.json`，或沿用同設定的既有 split。
-2. 依設定使用 frozen DINOv3，或先訓練最後一層 LoRA。
-3. 只提取 `bank` real 圖片；目前每張 224×224 圖片得到 `14×14×768` patch features。
-4. 將每張圖片保存為 `<part>/<video>/frame_*.npy`，中斷後可逐檔續接。
-5. 依 `foreground_minimum` 移除黑色背景比例過高的 patch。
-6. 合併 real patches，保存來源圖片和空間位置，再寫入完成紀錄與檔案雜湊。
+2. 只對 `bank` real 產生固定 seed 的正常增強視圖；calibration、evaluation 與 fake 不增強。
+3. 每個增強視圖同時加入光照、前景輕噪聲、2–7 度旋轉與輕微 scale／shear／translation。
+   幾何變換以黑色填補，噪聲只加入 SegFace 前景，避免把背景噪聲誤當成人臉 patch。
+4. 依設定使用 frozen DINOv3，或先訓練最後一層 LoRA，再分別對原圖與增強圖重新提取特徵。
+5. 每張 224×224 圖片保存完整 `14×14×768` float16 patch features，中斷後可逐檔續接。
+6. 依 `foreground_minimum` 移除黑色背景比例過高的 patch。原圖的前景 patch 全部進入
+   exact NN bank；每張增強視圖以固定 seed 抽取 25% 前景 patch，避免 bank 超過單張 GPU 顯存。
+7. 保存原始來源、增強參數、影像／設定雜湊與 patch 空間位置，再寫入完成紀錄。
+
+增強後的完整 token grid 也會納入 only-real reconstruction 與 RealPatchBank fitting，且沿用原圖
+`group_id`，所以原圖與其增強版本一定落在相同 family partition。這些資料只擴充正常訓練分布，
+不會進入 calibration 或 evaluation。預設每張 real 一個增強視圖；若修改任何增強參數，必須使用
+新的 experiment 名稱，才能保留不同 Feature Bank 的可比較性。
+
+```bash
+# 增強版 Stage 1；不要沿用未增強 bank 的實驗名稱。
+bash run.sh stage1 --exper SEGFACE_FROZEN_NN_AUG_V3 \
+  --face-source segface --method nearest --no-tune-encoder \
+  --deduplicate-content --boundary-weight 0.5 --workers 16 --batch-size 8 --gpus 4 5 6
+```
 
 如果 `method=cross_attention`，Stage 1 會在 real bank 建立後額外訓練受限 Q/K attention。`nearest` 與 `topk` 不需要這一步。
 
@@ -232,8 +249,8 @@ Stage 2 載入 Stage 1 的同一 encoder 與 real bank，接著：
 4. 只用 calibration real 分數的第 `threshold_quantile` 分位設定門檻；預設 99%。
 5. 對 evaluation real/fake 計算 AUROC、AP、FPR、TPR，並保存完整 patch 匹配證據。
 
-Stage 2 會在提取圖片特徵前檢查每張 GPU 的可用顯存。目前完整 bank 約含 602 萬個 patch，
-每張檢索 GPU 需要約 10 GiB 可用顯存；不足時程式會直接列出各 GPU 的需求，不會停在 0%。
+Stage 2 會在提取圖片特徵前，依實際 bank 大小檢查每張 GPU 的可用顯存。啟用預設增強後，
+NN bank 約增加 25% patches；不足時程式會直接列出各 GPU 的實際需求，不會停在 0%。
 載入時另有 `Stage 2：載入 FP16 bank` 進度列。
 
 | `retrieval.method` | Patch 異常距離 |
@@ -322,6 +339,10 @@ outputs/patch_mil/<EXPERIMENT>/
 RAG/normal/<EXPERIMENT>/
   bank_config.json
   splits.json
+  augmentations/
+    manifest.json                 # 原圖、增強參數與 augmented row
+    images/view_*/                # 可追溯的正常增強 PNG
+    features/view_*/              # 增強圖重新提取的完整 DINO patch tokens
   <part>/<video>/frame_*.npy
   retrieval/
     features.npy

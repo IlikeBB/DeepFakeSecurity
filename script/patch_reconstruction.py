@@ -12,6 +12,7 @@ from tqdm.auto import tqdm
 import yaml
 
 from models.patch_reconstruction import PatchReconstruction
+from script.bank_augmentation import load_bank_rows
 from script.bank_data import image_records, read_json, sha256, write_json
 from script.bank_retrieval import aggregate_patch_score
 from script.patch_explanation import (evidence_maps, explain, fit_patch_normalization,
@@ -197,7 +198,8 @@ def main(argv=None):
         if args.stage in ('train', 'all'):
             if checkpoint.exists() or (output / 'training.json').exists():
                 raise FileExistsError('Use a new --run-name to preserve existing training')
-            fit, val = _split_real_rows(image_records(plan['groups']['bank'], 'bank'), args.validation_fraction, args.seed)
+            bank_rows = load_bank_rows(plan, bank)
+            fit, val = _split_real_rows(bank_rows, args.validation_fraction, args.seed)
             rng = random.Random(args.seed)
             rng.shuffle(fit)
             rng.shuffle(val)
@@ -225,6 +227,10 @@ def main(argv=None):
                     break
             metadata = dict(architecture=architecture, fingerprint=fingerprint, config=vars(args), history=history,
                             fit_images=len(fit), validation_images=len(val), fake_training_images=0,
+                            original_bank_images=sum('augmentation' not in row for row in bank_rows),
+                            augmented_bank_images=sum('augmentation' in row for row in bank_rows),
+                            fit_augmented_images=sum('augmentation' in row for row in fit),
+                            validation_augmented_images=sum('augmentation' in row for row in val),
                             fit_families=sorted({r['group_id'] for r in fit}),
                             validation_families=sorted({r['group_id'] for r in val}),
                             checkpoint_sha256=sha256(checkpoint))

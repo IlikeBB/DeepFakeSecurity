@@ -7,12 +7,79 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
+from PIL import Image
 
-from script.bank_data import prepare_plan, merge_duplicate_families, select_full_groups
+from script.bank_augmentation import (load_bank_rows, prepare_bank_rows,
+                                      validate_augmentation_config)
+from script.bank_data import (prepare_plan, merge_duplicate_families, save_array,
+                              select_full_groups, sha256, write_json)
+from script.bank_retrieval import build, load_index
 from script.retrieval_io import extract_roles
 
 
 class BankDataTests(unittest.TestCase):
+    def test_real_bank_augmentation_is_deterministic_and_traceable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'real.png'
+            pixels = np.zeros((32, 32, 3), dtype=np.uint8)
+            pixels[6:26, 7:25] = np.arange(20, dtype=np.uint8)[:, None, None] + [80, 100, 120]
+            Image.fromarray(pixels).save(source)
+            stat = source.stat()
+            frame = dict(image_path=str(source), frame_index=0, feature_path='part/video/frame.npy',
+                         size=stat.st_size, mtime_ns=stat.st_mtime_ns,
+                         content_sha256=sha256(source))
+            plan = {'groups': {'bank': [dict(video_id='part/video', group_id='part/video', label=0,
+                                              crop_settings={'face_source': 'segface'}, frames=[frame])]}}
+            config = dict(enabled=True, views_per_image=1, seed=9,
+                          brightness=[.85, 1.15], noise_std=[.005, .02],
+                          rotation_degrees=[2., 7.], scale=[.97, 1.03],
+                          shear_degrees=2., translate_fraction=.02,
+                          bank_patch_fraction=.25)
+            bank = root / 'bank'
+            write_json(bank / 'bank_config.json', {'bank_augmentation': config})
+            first = prepare_bank_rows(plan, bank, config, workers=2)
+            second = prepare_bank_rows(plan, bank, config, workers=1)
+            self.assertEqual(first, second)
+            self.assertEqual(load_bank_rows(plan, bank), first)
+            augmented = first[1]
+            self.assertEqual(augmented['source_image_path'], str(source))
+            self.assertEqual(augmented['augmentation']['bank_patch_fraction'], .25)
+            self.assertTrue(Path(augmented['image_path']).is_file())
+            with Image.open(augmented['image_path']) as image:
+                result = np.asarray(image)
+            self.assertTrue((result[0, 0] == 0).all())
+            self.assertFalse(np.array_equal(result, pixels))
+            self.assertGreater(abs(augmented['augmentation']['parameters']['rotation_degrees']), 0)
+            self.assertGreater(augmented['augmentation']['parameters']['noise_std'], 0)
+
+            write_json(bank / 'splits.json', plan)
+            for index, record in enumerate(first):
+                feature = np.full((2, 2, 3), index + 1, dtype=np.float16)
+                path = bank / record['feature_path']
+                path.parent.mkdir(parents=True, exist_ok=True)
+                save_array(path, feature)
+                write_json(path.with_suffix('.json'), {
+                    'image': record, 'shape': list(feature.shape), 'dtype': str(feature.dtype)})
+            args = SimpleNamespace(workers=1, foreground_minimum=.25, top_fraction=.1,
+                                   boundary_weight=.5, face_source='segface',
+                                   bank_dir=str(root), experiment='bank',
+                                   bank_augmentation=config)
+            output = root / 'output'
+            build(plan, args, bank, output, first)
+            info, sources, arrays = load_index(plan, bank, output)
+            self.assertEqual(info['original_image_count'], 1)
+            self.assertEqual(info['augmented_image_count'], 1)
+            self.assertEqual(len(sources), 2)
+            self.assertEqual(len(arrays['features']), 5)  # Four original + one augmented patch.
+
+    def test_augmentation_config_rejects_unsafe_ranges(self):
+        with self.assertRaisesRegex(ValueError, 'rotation_degrees'):
+            validate_augmentation_config(dict(
+                enabled=True, views_per_image=1, seed=1, brightness=[.8, 1.2],
+                noise_std=[0., .01], rotation_degrees=[0., 30.], scale=[.9, 1.1],
+                shear_degrees=2., translate_fraction=.02, bank_patch_fraction=.25))
+
     def test_duplicate_family_union_is_transitive_and_keeps_derivatives(self):
         with tempfile.TemporaryDirectory() as tmp:
             def video(name, group, label, contents):

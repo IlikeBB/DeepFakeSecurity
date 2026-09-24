@@ -16,6 +16,7 @@ from tqdm.auto import tqdm
 import yaml
 
 from models.real_patch_bank import COMPONENTS, RealPatchBank, spatial_region_ids
+from script.bank_augmentation import load_bank_rows
 from script.bank_data import image_records, read_json, sha256, write_json
 from script.retrieval_io import ensure_experiment_config, experiment_lock, extract_roles, load_sample, metrics
 
@@ -388,7 +389,7 @@ def fit(plan, args, bank, cache, model_dir, output):
     checkpoint, metadata_path = model_dir / "model.safetensors", model_dir / "model.json"
     if (checkpoint.exists() or metadata_path.exists()) and not args.replace:
         raise ValueError(f"模型已存在：{model_dir}；若要重新建立請加 --replace")
-    rows = image_records(plan["groups"]["bank"], "bank")
+    rows = load_bank_rows(plan, bank)
     fit_rows, validation_rows = _split_real_rows(rows, args.validation_fraction, args.seed)
     model, relation_counts = _fit_statistics(fit_rows, args, bank, cache)
     validation_device = args.devices[0]
@@ -434,6 +435,10 @@ def fit(plan, args, bank, cache, model_dir, output):
         "minimum_relation_samples": args.minimum_relation_samples,
         "minimum_observed_relation_count": int(relation_counts[relation_counts > 0].min()),
         "fit_images": len(fit_rows), "validation_images": len(validation_rows),
+        "original_bank_images": sum('augmentation' not in row for row in rows),
+        "augmented_bank_images": sum('augmentation' in row for row in rows),
+        "fit_augmented_images": sum('augmentation' in row for row in fit_rows),
+        "validation_augmented_images": sum('augmentation' in row for row in validation_rows),
         "fit_families": sorted({row["group_id"] for row in fit_rows}),
         "validation_families": sorted({row["group_id"] for row in validation_rows}),
         "fake_training_images": 0,
