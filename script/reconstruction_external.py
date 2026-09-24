@@ -265,7 +265,7 @@ def evaluate(args):
     model = PatchReconstruction(**meta['architecture']).to(args.device)
     model.load_state_dict(load_file(str(checkpoint), device=args.device))
     rows = read_json(args.output / 'evaluation_rows.json')
-    scored = score(model, rows, args.output, config)
+    scored = score(model, rows, args.output, config, 'Celeb-DF reconstruction evaluation')
     threshold = float(np.quantile([r['reconstruction'] for r in calibration], config.threshold_quantile))
     for row in scored:
         row['score'] = row['reconstruction']
@@ -275,8 +275,9 @@ def evaluate(args):
     result = args.output / 'results' / source.name
     write_json(result / 'video_scores.json', videos)
     patch_normalization = fit_patch_normalization(
-        calibration, None, config.threshold_quantile, config.boundary_weight)
-    for row in calibration:
+        calibration, None, config.threshold_quantile, config.boundary_weight,
+        'DFDC source calibration patch normalization')
+    for row in tqdm(calibration, desc='DFDC source calibration patch fusion', unit='image'):
         maps = evidence_maps(row, None, patch_normalization, 0., config.boundary_weight)
         row['patch_fusion'] = patch_fusion_score(maps, config.top_fraction)
     patch_fusion_threshold = float(np.quantile(
@@ -284,7 +285,7 @@ def evaluate(args):
     selected = balanced_heatmap_rows(scored, args.heatmap_count)
     selected_paths = {row['image_path'] for row in selected}
     explanations, heatmaps = [], {}
-    for row in scored:
+    for row in tqdm(scored, desc='Celeb-DF evaluation explanations', unit='image'):
         maps = evidence_maps(row, None, patch_normalization, 0., config.boundary_weight)
         row['patch_fusion'] = patch_fusion_score(maps, config.top_fraction)
         row['patch_fusion_prediction'] = ('anomaly' if row['patch_fusion'] > patch_fusion_threshold
@@ -314,7 +315,7 @@ def evaluate(args):
                       prediction_method='mean of highest reconstruction-evidence patches',
                       limitation='Feature evidence, not pixel-level forgery ground truth.'))
     write_json(result / 'metrics.json', report)
-    for row in selected:
+    for row in tqdm(selected, desc='Celeb-DF evidence heatmaps', unit='image'):
         save_evidence_heatmap(row, heatmaps[row['image_path']],
                               result / 'heatmaps' / f"{row['sample_id']:08d}.png")
     print({key: report[key] for key in ('image', 'video_mean')}, flush=True)

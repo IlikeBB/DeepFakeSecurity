@@ -2,6 +2,7 @@
 import math
 
 import numpy as np
+from tqdm.auto import tqdm
 
 from script.bank_retrieval import patch_evidence
 
@@ -38,12 +39,13 @@ def _component_vectors(row, nearest, boundary_weight):
     return ids, grid, result
 
 
-def fit_patch_normalization(rows, lookup, quantile, boundary_weight):
+def fit_patch_normalization(rows, lookup, quantile, boundary_weight, progress_desc=None):
     """Fit component medians/scales using calibration-real patch evidence only."""
     if not rows or any(row['label'] != 0 for row in rows):
         raise ValueError('Patch evidence calibration must contain real images only')
     chunks = {'reconstruction': [], **({'nearest': []} if lookup is not None else {})}
-    for row in rows:
+    iterator = tqdm(rows, desc=progress_desc, unit='image') if progress_desc else rows
+    for row in iterator:
         nearest = lookup[row['image_path']] if lookup is not None else None
         _, _, components = _component_vectors(row, nearest, boundary_weight)
         for name, values in components.items():

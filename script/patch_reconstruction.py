@@ -83,10 +83,10 @@ def normalized_fusion(calibration, evaluation, weight, quantile):
 
 
 @torch.no_grad()
-def score(model, rows, bank, args):
+def score(model, rows, bank, args, description='reconstruction scoring'):
     model.eval()
     result = []
-    for x, mask, indices in tqdm(loader(rows, bank, args), desc='reconstruction scoring'):
+    for x, mask, indices in tqdm(loader(rows, bank, args), desc=description, unit='batch'):
         _, errors, valid = model(x.to(args.device), mask.to(args.device))
         for error, keep, index in zip(errors.cpu().numpy(), valid.cpu().numpy(), indices):
             if not keep.any():
@@ -101,10 +101,10 @@ def score(model, rows, bank, args):
     return result
 
 
-def attach_nearest(scored, path):
+def attach_nearest(scored, path, description='attach nearest scores'):
     baseline = read_json(path)
     lookup = nearest_lookup(baseline, scored)
-    for row in scored:
+    for row in tqdm(scored, desc=description, unit='image'):
         other = lookup[row['image_path']]
         if not np.isfinite(other['score']):
             raise ValueError('Invalid NN score')
@@ -242,8 +242,10 @@ def main(argv=None):
             ensure_cache(plan, args, bank, bank / 'cache', ('calibration', 'evaluation'))
             model = PatchReconstruction(**meta['architecture']).to(args.device)
             model.load_state_dict(load_file(str(checkpoint), device=args.device))
-            calibration = score(model, calibration_rows, bank, args)
-            evaluation = score(model, image_records(plan['groups']['evaluation'], 'evaluation'), bank, args)
+            calibration = score(model, calibration_rows, bank, args,
+                                'Stage 2 calibration reconstruction')
+            evaluation = score(model, image_records(plan['groups']['evaluation'], 'evaluation'), bank, args,
+                               'Stage 2 evaluation reconstruction')
             nearest_hashes = {}
             nearest_lookups = {}
             if args.nn_weight > 0:
@@ -253,7 +255,8 @@ def main(argv=None):
                     raise ValueError('NN source configuration or split differs from reconstruction')
                 for role, scored in [('calibration', calibration), ('evaluation', evaluation)]:
                     path = Path(args.source_results_dir) / args.experiment / 'stage2' / f'{role}_scores.json'
-                    nearest_lookups[role] = attach_nearest(scored, path)
+                    nearest_lookups[role] = attach_nearest(
+                        scored, path, f'Stage 2 {role} nearest-score fusion')
                     nearest_hashes[role] = sha256(path)
             stats, threshold = normalized_fusion(calibration, evaluation, args.nn_weight, args.threshold_quantile)
             report = dict(image=metrics(evaluation, threshold), normalization=stats, nn_weight=args.nn_weight,
@@ -280,8 +283,8 @@ def main(argv=None):
             write_json(output / 'stage2/video_scores.json', evaluation_videos)
             patch_normalization = fit_patch_normalization(
                 calibration, nearest_lookups.get('calibration'), args.threshold_quantile,
-                args.boundary_weight)
-            for row in calibration:
+                args.boundary_weight, 'Stage 2 calibration patch normalization')
+            for row in tqdm(calibration, desc='Stage 2 calibration patch fusion', unit='image'):
                 nearest = (nearest_lookups['calibration'][row['image_path']]
                            if 'calibration' in nearest_lookups else None)
                 maps = evidence_maps(row, nearest, patch_normalization,
@@ -293,7 +296,7 @@ def main(argv=None):
             selected_paths = {row['image_path'] for row in selected}
             explanations = []
             heatmaps = {}
-            for row in evaluation:
+            for row in tqdm(evaluation, desc='Stage 2 evaluation explanations', unit='image'):
                 nearest = (nearest_lookups['evaluation'][row['image_path']]
                            if 'evaluation' in nearest_lookups else None)
                 maps = evidence_maps(row, nearest, patch_normalization,
@@ -322,7 +325,7 @@ def main(argv=None):
                 'limitation': 'Feature evidence, not pixel-level forgery ground truth.',
             }
             write_json(output / 'stage2/metrics.json', report)
-            for row in selected:
+            for row in tqdm(selected, desc='Stage 2 evidence heatmaps', unit='image'):
                 save_evidence_heatmap(row, heatmaps[row['image_path']],
                                       output / 'stage2/heatmaps' / f"{row['sample_id']:08d}.png")
             print(report['image'], flush=True)
