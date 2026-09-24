@@ -213,3 +213,29 @@ crop_face:
   image_size: 224
   detection_size: 640  # 偵測輸入最長邊上限；裁切仍取自原始畫面
   detection_batch_size: 2  # 每次送入 RetinaFace 的幀數；共享 GPU 顯存不足時改為 1
+
+# Only-real 中心不可見的局部 DINO 特徵重建；獨立於原 NN baseline。
+patch_reconstruction:
+  bank_dir: RAG/normal
+  source_results_dir: outputs/feature_bank
+  results_dir: outputs/patch_reconstruction
+  batch_size: 32
+  extract_batch_size: 8
+  workers: 4
+  epochs: 30
+  patience: 5
+  learning_rate: 0.0003
+  hidden_dim: 128
+  heads: 4
+  layers: 2
+  heatmap_count: 32
+  radius: 1
+  validation_fraction: 0.15
+  foreground_minimum: 0.5
+  top_fraction: 0.1
+  boundary_weight: 0.5
+  threshold_quantile: 0.99
+  nn_weight: 0.5
+  max_train_images: 0
+  max_validation_images: 0
+  seed: 42

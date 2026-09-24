@@ -3,6 +3,8 @@
 models/clip-vit-base-patch16/
 models/token_list
 models/segface/swinb_celeba_512/
+models/patch_mil/*/
+models/real_patch_bank/*/
 __pycache__/
 *.pyc
 .env

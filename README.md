@@ -410,3 +410,109 @@ conda run --no-capture-output -n pt230 \
 bash mission.sh --help
 bash run.sh --help
 ```
+
+### Only-real 局部特徵重建（Stage 2 實驗分支）
+
+`patch-reconstruction` 沿用 frozen Stage 1 的 DINO 快取，不變更原本 NN baseline。
+每個 token 先獨立正規化並投影到 128 維，再取中心以外的 3×3 鄰域
+（8 個位置，加入可學習相對位置）。兩層、4 heads 的 Transformer decoder
+以 learned query cross-attend 周圍前景特徵，輸出中心 768 維特徵。
+解碼器看不到中心 token，也沒有中心 residual/skip connection。
+訓練 loss 是有鄰居的前景 patch cosine error 平均；背景不提供特徵，無有效鄰居
+的 patch 不參與重建。若整張圖都沒有可重建 patch，明確報錯。
+
+只使用 bank real，按 source family 分出 15% real validation，AdamW 訓練，
+以 validation loss 選 checkpoint／early stopping。calibration real 與 evaluation
+不參與訓練或選模。預設所有 bank 訓練／驗證影像均使用；image limits 僅供 smoke test。
+本分支要求凍結編碼器；不接受啟用 LoRA 的 Stage 1。
+
+重建 patch 誤差採前景邊界權重 0.5，再平均最大的 10% 得到影像分數。
+預設額外讀取**同一實驗完整影像集合**的 NN Stage 2 分數，在影像分數層融合：
+各分量用 calibration real 的 median 與 `(q99 - median)` 正規化，不裁切；
+`score = 0.5 * normalized_NN + 0.5 * normalized_reconstruction`。
+融合後再以 calibration real q99 設門檻，預測使用嚴格 `score > threshold`。
+權重在訓練前宣告，不能依 evaluation fake 調整。`--nn-weight 0` 可測純重建，
+這時不需要 NN Stage 2 結果。這不是 patch 級 NN 距離融合。
+
+```bash
+# 預先完成同一實驗的原 NN Stage 2，再執行重建訓練與完整評估。
+bash mission.sh patch-reconstruction --stage all \
+  --exper SEGFACE_FROZEN_NN_DEDUP_V2 --run-name local_transformer_v1 --device cuda:0
+
+# 若只先訓練：--stage train；之後同 run-name 使用 --stage evaluate。
+# 純重建消融（獨立 run，訓練與評估都要指定同一權重）
+bash mission.sh patch-reconstruction --stage all \
+  --exper SEGFACE_FROZEN_NN_DEDUP_V2 --run-name reconstruction_only_v1 \
+  --nn-weight 0 --device cuda:0
+```
+
+輸出在 `outputs/patch_reconstruction/<experiment>/<run-name>/`：
+`model.safetensors`、`training.json`（設定、來源 hash、family 分組、loss history），
+`stage2/metrics.json`（融合及各分量 AUROC/AP/FPR/TPR、校準參數），以及
+calibration/evaluation scores（含 patch IDs、原始重建 error、有效 patch 數），
+以及 `stage2/heatmaps/` 的固定 0–2 cosine-error 色階圖；熱圖不是偽造機率或
+像素級 ground-truth 定位評估。`--heatmap-count 0` 可關閉 PNG 匯出。
+模型既有時不覆蓋，請改用新 run-name。預設單 GPU；`--device cpu` 也可執行。
+
+**研究限制**：cached DINO token 已經由 self-attention 混合全圖資訊。
+中心不可見只保證解碼器輸入沒有直接複製中心，並不等於影像層級的資訊隔離。
+此外，鄰近 patch 同時偽造可能仍然自洽；正常表情、遮擋或壓縮亦可能提高誤差。
+因此低 real reconstruction loss 不能當作 fake 偵測能力提升的證據；需比較同切分
+的 NN、重建與融合結果。若要更嚴格隔離目標資訊，下一步需 image-space masking
+後重跑 frozen encoder，會增加特徵抽取成本。本次沒有新增這種抽取流程。
+
+#### DFDC → Celeb-DF 外部測試（strict source-only protocol）
+
+目前依使用者要求只執行 Celeb-DF 資料前處理，模型訓練與後續評估已暫停。
+預設 `script.reconstruction_external` 的 stage 為 `segment`：只做 SegFace、標籤與資料清單，
+不抽 DINO 特徵、不訓練、不評估。資料清單為 `data_manifest.json`，統計為 `data_summary.json`。
+專用入口：`bash mission_Celeb-df.sh all`，只依序裁切與分割。
+RetinaFace 裁切存於 `Celeb-df-Frame-Face`；分割 real 存於
+`/ssd8/chihyu/Dataset/DeepFake_Dataset/Celeb-df-Frame-Face-nomral`，fake 存於
+`/ssd8/chihyu/Dataset/DeepFake_Dataset/Celeb-df-Frame-Face-anomaly`（沿用指定的 `nomral` 拼法）。
+兩個 SegFace 資料夾都和 DFDC 一樣採單層扁平結構，不建立類別／影片子資料夾；
+檔名為 `<來源類別>-<影片名稱>-<frame 名稱>.jpg`，例如
+`Celeb-synthesis-id37_id21_0000-frame_000274.jpg`。
+
+```bash
+conda run --no-capture-output -n pt230 python -m script.reconstruction_external \
+  --stage segment --device cuda:3
+```
+
+以下模型與完整評估命令保留供後續確認後使用。
+
+目前採 DFDC real 訓練、DFDC held-out real 選模、DFDC calibration real 設門檻；
+**Celeb-DF 只讀取官方測試清單的 518 支影片**，每支最多 32 幀，不把其 real 用於
+fine-tuning、normalization、early stopping 或 threshold calibration。
+因此本實驗是單來源泛化評估，不是多來源 real 訓練。多來源實驗必須另開協定，
+不能將這批 Celeb-DF 測試影像加入訓練後仍稱它為外部測試。
+
+```bash
+# 1. RetinaFace：--label-csv '' 清除 YAML 的 DFDC CSV，採 Celeb-DF 官方測試清單。
+conda run --no-capture-output -n pt230 python script/crop_face.py \
+  --data-root /ssd2/DeepFakes/celeb-df-video --label-csv '' --split test \
+  --output-dir /ssd8/chihyu/Dataset/DeepFake_Dataset/Celeb-df-Frame-Face --num-frames 32 --gpus 3
+
+# 2. 全部裁切完成後：SegFace → frozen DINO；可安全重用相同設定下的快取。
+conda run --no-capture-output -n pt230 python -m script.reconstruction_external \
+  --stage prepare --device cuda:3
+
+# 3. DFDC Transformer 的訓練及 Stage 2 評估都完成後執行。
+conda run --no-capture-output -n pt230 python -m script.reconstruction_external \
+  --stage evaluate --device cuda:3 \
+  --source-run outputs/patch_reconstruction/SEGFACE_FROZEN_NN_DEDUP_V2/local_transformer_v1
+```
+
+外部輸出：`/ssd8/chihyu/Dataset/DeepFake_Dataset/Celeb-df-external/results/local_transformer_v1/metrics.json`。
+這裡評估**純重建分數**，並與 DFDC 的純重建分量比較；沒有暗中換成 Celeb-DF
+自己的 NN bank。影像分數沿用 DFDC real 校準影像 q99；影片分數為影像分數平均，
+影片門檻另以 DFDC calibration real 的「每影片平均」q99 決定。
+報告提供兩個層級的 AUROC、AP、FPR、TPR、門檻，以及預期／成功影片數與
+RetinaFace／SegFace 失敗覆蓋率。AP 受各測試集偽造比例影響，不能單看 AP 比泛化。
+
+外部資料檢查包含官方清單標籤（官方 1=real，本專案 1=fake）、DINO 權重與 processor
+hash、來源 split hash、RetinaFace 設定、SegFace 設定與權重 hash，以及對 DFDC
+所有 partition 的 exact segmented-JPEG hash overlap。這些檢查**不保證跨資料集
+人物完全互斥，也不保證不存在近重複畫面**。前景／臉部偵測失敗不應被默默當作
+成功辨識；請一併查看 `coverage.json`。外部 PNG 依固定順序、每影片一幀抽樣，
+real/fake 各一半；沒有使用分數挑選看起來最成功的案例。
