@@ -1,4 +1,4 @@
-"""Exact patch cosine nearest neighbors with bounded distance-matrix memory."""
+"""Exact nearest-neighbor and weighted Top-K patch search."""
 
 import math
 
@@ -91,3 +91,83 @@ class PatchBank:
         count = max(1, math.ceil(patches.shape[1] * top_fraction))
         scores = np.sort(patch_distances, axis=1)[:, -count:].mean(axis=1)
         return scores, patch_distances, neighbors
+
+
+class TopKPatchBank(PatchBank):
+    """Reconstruct each query patch from its closest normal-bank references."""
+
+    def __init__(self, bank, device, query_chunk_size, bank_chunk_size, config, families=None, progress=None):
+        super().__init__(bank, device, query_chunk_size, bank_chunk_size, progress=progress)
+        self.config = config
+        self.families = None if families is None else torch.as_tensor(families, device=device)
+
+    @torch.no_grad()
+    def nearest(self, query):
+        query = F.normalize(torch.as_tensor(query, dtype=self.bank.dtype, device=self.bank.device), dim=-1)
+        if query.ndim != 2 or query.shape[1] != self.bank.shape[1] or not torch.isfinite(query).all():
+            raise ValueError("Invalid retrieval query")
+        if torch.any(query.norm(dim=-1) == 0):
+            raise ValueError("Query contains zero-norm features")
+        count = self.config["neighbors"]
+        if count > len(self.bank):
+            raise ValueError("Top-K exceeds reference bank size")
+        all_values, all_ids = [], []
+        for start in range(0, len(query), self.query_chunk_size):
+            batch = query[start:start + self.query_chunk_size]
+            best = torch.empty((len(batch), 0), device=batch.device, dtype=self.bank.dtype)
+            ids = torch.empty((len(batch), 0), device=batch.device, dtype=torch.long)
+            for offset in range(0, len(self.bank), self.bank_chunk_size):
+                similarities = batch @ self.bank[offset:offset + self.bank_chunk_size].T
+                values, local = similarities.topk(min(count, similarities.shape[1]), dim=1)
+                combined = torch.cat((best, values), dim=1)
+                candidates = torch.cat((ids, local + offset), dim=1)
+                best, positions = combined.topk(min(count, combined.shape[1]), dim=1)
+                ids = candidates.gather(1, positions)
+            all_values.append(best)
+            all_ids.append(ids)
+        return torch.cat(all_values).float(), torch.cat(all_ids)
+
+    @torch.inference_mode()
+    def score_candidates(self, query, candidate_ids, max_per_family):
+        """Reweight an existing Top-K list after limiting repeated source families."""
+        if self.families is None:
+            raise ValueError("Family IDs required for capped candidate scoring")
+        query = F.normalize(torch.as_tensor(query, dtype=torch.float32, device=self.bank.device), dim=-1)
+        ids = torch.as_tensor(candidate_ids, device=self.bank.device)
+        candidates = self.bank[ids].float()
+        similarities = (query[:, None] * candidates).sum(-1)
+        families = self.families[ids]
+        keep = torch.ones_like(similarities, dtype=torch.bool)
+        for position in range(1, ids.shape[1]):
+            keep[:, position] = (families[:, :position] == families[:, position, None]).sum(1) < max_per_family
+        weights = (similarities / self.config["temperature"]).masked_fill(~keep, -torch.inf).softmax(-1)
+        reconstructed = torch.einsum("bk,bkd->bd", weights, candidates)
+        distances = (1 - F.cosine_similarity(query, reconstructed)).clamp(0, 2)
+        return distances.cpu().numpy(), keep.cpu().numpy()
+
+    @torch.inference_mode()
+    def score(self, patches, top_fraction):
+        if patches.ndim != 3 or patches.shape[0] != 1:
+            raise ValueError("Top-K scoring expects one image at a time")
+        query = F.normalize(torch.as_tensor(patches[0], dtype=torch.float32, device=self.bank.device), dim=-1)
+        similarities, ids = self.nearest(query)
+        candidates = self.bank[ids].float()
+        weights = (similarities / self.config["temperature"]).softmax(-1)
+        reconstructed = torch.einsum("bk,bkd->bd", weights, candidates)
+        nearest_distances = (1 - similarities[:, 0]).clamp(0, 2)
+        distances = (1 - F.cosine_similarity(query, reconstructed)).clamp(0, 2)
+        nearest_distances = nearest_distances.cpu().numpy()
+        distances = distances.cpu().numpy()
+        count = max(1, math.ceil(len(query) * top_fraction))
+        scores = {
+            "nearest": float(np.sort(nearest_distances)[-count:].mean()),
+            "topk": float(np.sort(distances)[-count:].mean()),
+        }
+        self.details = {
+            "candidate_ids": ids.cpu().numpy(),
+            "weights": weights.cpu().numpy(),
+            "nearest_distances": nearest_distances,
+            "topk_distances": distances,
+            "scores": scores,
+        }
+        return np.array([scores["topk"]]), distances[None], ids[:, 0].cpu().numpy()[None]

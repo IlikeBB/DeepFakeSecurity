@@ -5,16 +5,25 @@ import torch
 from torch.nn import functional as F
 
 
-def masks_from_logits(logits, images, config):
-    masks = []
+def semantic_labels_from_logits(logits, images, config):
+    """Return confident SegFace class IDs; 255 marks uncertain pixels."""
+    maps = []
     for image, output in zip(images, logits):
         resized = F.interpolate(output[None], size=image.size[::-1], mode="bilinear", align_corners=False)
         confidence, labels = resized.softmax(1).max(1)
-        labels = labels[0].cpu().numpy()
+        labels = labels[0].to(torch.uint8).cpu().numpy()
         confident = confidence[0].cpu().numpy() >= config["pixel_confidence"]
+        labels = np.where(confident, labels, 255).astype(np.uint8)
+        maps.append(labels)
+    return maps
+
+
+def masks_from_logits(logits, images, config):
+    masks = []
+    for labels in semantic_labels_from_logits(logits, images, config):
         mask = np.full(labels.shape, 255, dtype=np.uint8)
-        mask[confident & np.isin(labels, config["background_ids"])] = 0
-        mask[confident & np.isin(labels, config["face_ids"])] = 1
+        mask[np.isin(labels, config["background_ids"])] = 0
+        mask[np.isin(labels, config["face_ids"])] = 1
         masks.append(mask)
     return masks
 
@@ -40,6 +49,14 @@ class SegFaceParser:
         self.config, self.device = config, device
 
     @torch.inference_mode()
-    def __call__(self, images):
+    def logits(self, images):
         inputs = torch.stack([self.transform(image) for image in images]).to(self.device)
-        return masks_from_logits(self.model(inputs, None, None), images, self.config)
+        return self.model(inputs, None, None)
+
+    @torch.inference_mode()
+    def __call__(self, images):
+        return masks_from_logits(self.logits(images), images, self.config)
+
+    @torch.inference_mode()
+    def semantic(self, images):
+        return semantic_labels_from_logits(self.logits(images), images, self.config)

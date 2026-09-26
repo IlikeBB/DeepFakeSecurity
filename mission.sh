@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -eo pipefail
 
-# DeepFakeSecurity 唯一的人臉前處理工具：RetinaFace
+# Real-Only DINOv3 PatchBank 的人臉前處理與兩階段實驗入口。
 #
 # 查看說明
-#   cd /ssd8/chihyu/Project/DeepFakeSecurity
+#   cd /ssd8/chihyu/Project/Real-Only-DINOv3-PatchBank-for-Deepfake-Detection
 #   bash mission.sh --help
 #
 # 少量資料執行範例：兩支影片、每支四幀
@@ -21,9 +21,9 @@ set -eo pipefail
 #
 # 已完成且設定一致的影片會直接跳過；不完整輸出會自動重建。
 # 只有在抽幀、門檻或裁切設定改變，且確定全部重做時才加入 --overwrite。
-# 輸出：/ssd8/chihyu/Dataset/DeepFake_Dataset/DFDC/<part>/<video>/
+# 輸出：/ssd8/chihyu/Dataset/DeepFake_Dataset/DFDC-Frame-Face/<part>/<video>/
 #
-# Feature bank：Stage 1 直接讀取上述 RetinaFace JPG 與 metadata，不需要第二個分割工具。
+# Feature bank：Stage 1 依 face_source 讀取 RetinaFace 或 SegFace JPG，並沿用 metadata。
 #   bash mission.sh stage1
 #   bash mission.sh stage2
 #   bash mission.sh all

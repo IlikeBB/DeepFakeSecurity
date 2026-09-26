@@ -14,6 +14,7 @@ from tqdm.auto import tqdm
 from script.bank_data import image_records, read_json, save_array, sha256, write_json
 from script.bank_encoder import encode, load_encoder
 from script.bank_export import load_feature
+from script.experiment_paths import stage1_output
 
 
 @contextmanager
@@ -29,13 +30,14 @@ def experiment_lock(directory):
 
 def ensure_experiment_config(bank, output, spec):
     """Recover missing metadata only from the matching Stage 1 backup."""
+    bank.mkdir(parents=True, exist_ok=True)
     config_file = bank / "bank_config.json"
     if config_file.exists():
         existing = read_json(config_file)
         if existing != spec:
             raise ValueError("實驗資料／模型設定已變更；請在 utils/config.yaml 的 retrieval.experiment 填入新名稱，或使用 --exper")
         return
-    stage1 = output / "stage1"
+    stage1 = stage1_output(output)
     backup = stage1 / "config.json"
     completion = stage1 / "retrieval.json"
     if not backup.exists():

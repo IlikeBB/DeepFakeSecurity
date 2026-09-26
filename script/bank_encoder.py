@@ -16,9 +16,9 @@ def load_encoder(args):
     model.requires_grad_(False)
     checkpoint = getattr(args, "encoder_checkpoint", None)
     if checkpoint:
-        from script.dino_lora import load_lora
+        from Stage1.encoder_tuning import load_encoder_tuning
 
-        load_lora(model, checkpoint, args.encoder_tuning, args.device)
+        load_encoder_tuning(model, checkpoint, args.encoder_tuning, args.device)
         model.eval()
     return model, processor
 

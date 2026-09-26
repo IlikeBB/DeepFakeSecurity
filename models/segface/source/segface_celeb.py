@@ -4,11 +4,8 @@ import torch.nn.functional as F
 import torchvision.models as models
 
 from typing import Any, Optional, Tuple, Type
-from torchvision.models import convnext_large, convnext_base, convnext_small, convnext_tiny, swin_b, swin_v2_b, swin_v2_s, swin_v2_t, mobilenet_v3_large, efficientnet_v2_m
-import pdb
+from torchvision.models import convnext_base, convnext_small, swin_b, swin_v2_b, swin_v2_s, swin_v2_t, mobilenet_v3_large, efficientnet_v2_m
 import numpy as np
-import sys
-import os
 from .transformer import LayerNorm2d, TwoWayTransformer
 
 class MLP(nn.Module):
@@ -242,7 +239,6 @@ class SegFaceCeleb(nn.Module):
             self.target_layer_names = ['2', '3', '5', '8']
             self.multi_scale_features = []
 
-        embed_dim = 1024
         out_chans = 256
         
         self.pe_layer = PositionEmbeddingRandom(out_chans // 2)   
@@ -299,8 +295,7 @@ class SegFaceCeleb(nn.Module):
     def forward(self, x, labels, dataset):
         self.multi_scale_features.clear()
         
-        _,_,h,w = x.shape
-        features = self.backbone(x).squeeze()
+        self.backbone(x)
         
         batch_size = self.multi_scale_features[-1].shape[0]
         all_hidden_states = ()
@@ -323,24 +318,3 @@ class SegFaceCeleb(nn.Module):
             )
     
         return seg_output
-
-if __name__ == "__main__":
-    input_resolution = 512
-    model_name = "swin_base"
-    model = SegFaceCeleb(input_resolution, model_name)
-    
-    batch_size = 4
-    num_channels = 3
-    height = 512
-    width = 512
-
-    x = torch.randn(batch_size, num_channels, height, width)
-    
-    labels = {
-        "lnm_seg": torch.randn(batch_size, 5, 2)
-    }
-    
-    dataset = torch.tensor([0,0,0,0])
-
-    seg_output = model(x, labels, dataset)
-    print("Segmentation Output Shape:", seg_output.shape)

@@ -3,7 +3,7 @@ import unittest
 import numpy as np
 import torch
 
-from script.bank_search import PatchBank
+from Stage2.bank_search import PatchBank, TopKPatchBank
 
 
 class PatchBankTests(unittest.TestCase):
@@ -27,6 +27,20 @@ class PatchBankTests(unittest.TestCase):
     def test_rejects_zero_norm_bank_patch(self):
         with self.assertRaisesRegex(ValueError, "zero-norm"):
             PatchBank(np.zeros((1, 3), dtype=np.float16), "cpu", bank_chunk_size=1)
+
+    def test_topk_reconstruction_keeps_candidate_evidence(self):
+        bank = np.array([[1, 0], [0.8, 0.2], [0, 1]], dtype=np.float32)
+        patches = np.array([[[1, 0], [0, 1]]], dtype=np.float32)
+        search = TopKPatchBank(bank, "cpu", query_chunk_size=1, bank_chunk_size=2,
+                               config={"neighbors": 2, "temperature": 0.07})
+
+        scores, distances, neighbors = search.score(patches, top_fraction=0.5)
+
+        self.assertEqual(scores.shape, (1,))
+        self.assertEqual(distances.shape, (1, 2))
+        np.testing.assert_array_equal(neighbors, [[0, 2]])
+        self.assertEqual(search.details["candidate_ids"].shape, (2, 2))
+        self.assertEqual(set(search.details["scores"]), {"nearest", "topk"})
 
 
 if __name__ == "__main__":

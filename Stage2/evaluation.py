@@ -1,28 +1,16 @@
-"""Real RetinaFace-crop patch retrieval with traceable cosine neighbors."""
+"""Stage 2 held-out patch retrieval, calibration, evaluation, and ablation."""
 
 from concurrent.futures import ThreadPoolExecutor
 import math
-from pathlib import Path
 
 import numpy as np
-from PIL import Image
 from tqdm.auto import tqdm
 
-from script.bank_data import image_records, read_json, save_array, sha256, write_json
-from script.bank_search import PatchBank
+from Stage1.bank_builder import foreground_patches, load_index
+from Stage2.bank_search import PatchBank, TopKPatchBank
+from script.bank_data import image_records, sha256, write_json
+from script.experiment_paths import stage1_output, stage2_output
 from script.retrieval_io import load_sample, map_devices, metrics
-
-
-def foreground_patches(features, image_path, minimum):
-    """Estimate valid patch occupancy in a face crop."""
-    h, w, _ = features.shape
-    with Image.open(image_path) as image:
-        mask = (np.asarray(image.convert("RGB")).max(axis=-1) > 16).astype(np.uint8) * 255
-    occupancy = np.asarray(Image.fromarray(mask).resize((w, h), Image.Resampling.BOX), dtype=np.float32) / 255
-    ids = np.flatnonzero(occupancy.reshape(-1) >= minimum)
-    if not len(ids):
-        raise ValueError(f"No foreground patches: {image_path}")
-    return features.reshape(-1, features.shape[-1])[ids], ids, (h, w)
 
 
 def aggregate_patch_score(distances, ids, grid, fraction, boundary_weight=1.):
@@ -38,73 +26,9 @@ def aggregate_patch_score(distances, ids, grid, fraction, boundary_weight=1.):
     return float(np.sort(evidence)[-count:].mean())
 
 
-def build(plan, args, bank, output):
-    stage1 = output / "stage1"
-    stage1.mkdir(parents=True, exist_ok=True)
-    completion = stage1 / "retrieval.json"
-    if completion.exists():
-        load_index(plan, bank, output)
-        print("Stage 1 已完成，沿用 real patch bank 索引。", flush=True)
-        return
-    rows = image_records(plan["groups"]["bank"], "bank")
-    if not rows or any(row["label"] != 0 for row in rows):
-        raise ValueError("Retrieval bank must contain real training images only")
-
-    def read(row):
-        _, features = load_sample(bank, row)
-        return foreground_patches(features, row["image_path"], args.foreground_minimum)
-
-    vectors, origins, patches = [], [], []
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        for i, (values, ids, grid) in enumerate(tqdm(pool.map(read, rows), total=len(rows),
-                                                   desc="Stage 1：建立 real 檢索索引", unit="image")):
-            rows[i]["grid"] = list(grid)
-            vectors.append(values)
-            origins.append(np.full(len(ids), i, dtype=np.int32))
-            patches.append(ids.astype(np.int32))
-    directory = Path(__file__).resolve().parents[1] / args.bank_dir / args.experiment / "retrieval"
-    # 相對路徑固定以專案根目錄解析，避免從其他目錄啟動時寫到錯誤位置。
-    directory.mkdir(parents=True, exist_ok=True)
-    files = {"features": directory / "features.npy", "origins": directory / "origins.npy",
-             "patch_ids": directory / "patch_ids.npy", "sources": stage1 / "sources.json"}
-    for key, values in (("features", vectors), ("origins", origins), ("patch_ids", patches)):
-        save_array(files[key], np.concatenate(values))
-    write_json(files["sources"], rows)
-    write_json(completion, {
-        "method": f"real {args.face_source} face patches; exact cosine 1-NN; highest-distance patch mean",
-        "image_count": len(rows), "patch_count": sum(len(values) for values in vectors),
-        "foreground_minimum": args.foreground_minimum, "top_fraction": args.top_fraction,
-        "plan_sha256": sha256(bank / "splits.json"),
-        "source_config_sha256": sha256(bank / "bank_config.json"),
-        "files": {key: {"path": str(path.resolve()), "sha256": sha256(path)} for key, path in files.items()},
-    })
-
-
-def load_index(plan, bank, output):
-    info = read_json(output / "stage1/retrieval.json")
-    if "alignment" in info:
-        raise ValueError("此索引使用已移除的文字對齊分支；請另取 experiment 名稱，重新建立原始 DINO bank")
-    if (info["plan_sha256"] != sha256(bank / "splits.json")
-            or info["source_config_sha256"] != sha256(bank / "bank_config.json")):
-        raise ValueError("Retrieval index does not match source configuration/split")
-    for item in tqdm(info["files"].values(), desc="驗證 bank 檔案", unit="file", dynamic_ncols=True):
-        if sha256(item["path"]) != item["sha256"]:
-            raise ValueError(f"Retrieval index changed: {item['path']}")
-    rows = read_json(info["files"]["sources"]["path"])
-    expected = image_records(plan["groups"]["bank"], "bank")
-    if [{k: v for k, v in row.items() if k != "grid"} for row in rows] != expected:
-        raise ValueError("Bank contains unexpected sources")
-    arrays = {key: np.load(info["files"][key]["path"], mmap_mode="r", allow_pickle=False)
-              for key in ("features", "origins", "patch_ids")}
-    return info, rows, arrays
-
-
-def match_image(features, image_path, search, info, sources, arrays, match_count):
-    selected, ids, grid = foreground_patches(features, image_path, info["foreground_minimum"])
-    scores, distances, neighbors = search.score(selected[None], info["top_fraction"])
-    distances, neighbors = distances[0], neighbors[0]
+def summarize_match(distances, neighbors, ids, grid, info, sources, arrays, match_count, details=None):
+    """Convert patch search output into the persisted per-image result."""
     count = max(1, math.ceil(len(ids) * info["top_fraction"]))
-    details = getattr(search, "details", None)
     scoring = np.argsort(-distances, kind="stable")[:count]
     matches = []
     # These are the patches contributing most to the image's anomaly score.
@@ -128,18 +52,124 @@ def match_image(features, image_path, search, info, sources, arrays, match_count
     neighbor_map.reshape(-1)[ids] = neighbors
     if details:
         details["query_patch_ids"] = ids
-    return {"score": float(scores[0]), "foreground_patches": len(ids), "scoring_patches": count,
+    score = float(np.sort(distances)[-count:].mean())
+    return {"score": score, "foreground_patches": len(ids), "scoring_patches": count,
             "matches": matches, **({"comparison_scores": details["scores"]} if details else {})}, distance_map, neighbor_map
+
+
+def match_image(features, image_path, search, info, sources, arrays, match_count):
+    selected, ids, grid = foreground_patches(features, image_path, info["foreground_minimum"])
+    _, distances, neighbors = search.score(selected[None], info["top_fraction"])
+    details = getattr(search, "details", None)
+    if details:
+        details = dict(details, scores={
+            "nearest": float(np.sort(details["nearest_distances"])[
+                -max(1, math.ceil(len(ids) * info["top_fraction"])):].mean()),
+            "topk": float(np.sort(details["topk_distances"])[
+                -max(1, math.ceil(len(ids) * info["top_fraction"])):].mean()),
+        })
+    return summarize_match(distances[0], neighbors[0], ids, grid, info, sources, arrays,
+                           match_count, details)
+
+
+def match_batch(items, search, info, sources, arrays, match_count):
+    """Search several images together so exact retrieval fills query chunks."""
+    prepared = [(row, *foreground_patches(features, row["image_path"], info["foreground_minimum"]))
+                for row, features in items]
+    merged = np.concatenate([selected for _, selected, _, _ in prepared])
+    _, all_distances, all_neighbors = search.score(merged[None], info["top_fraction"])
+    all_distances, all_neighbors = all_distances[0], all_neighbors[0]
+    all_details = getattr(search, "details", None)
+    results, offset = [], 0
+    for row, selected, ids, grid in prepared:
+        stop = offset + len(selected)
+        details = None
+        if all_details:
+            details = {key: value[offset:stop] for key, value in all_details.items()
+                       if key != "scores"}
+            count = max(1, math.ceil(len(ids) * info["top_fraction"]))
+            details["scores"] = {
+                "nearest": float(np.sort(details["nearest_distances"])[-count:].mean()),
+                "topk": float(np.sort(details["topk_distances"])[-count:].mean()),
+            }
+        prediction, distances, neighbors = summarize_match(
+            all_distances[offset:stop], all_neighbors[offset:stop], ids, grid,
+            info, sources, arrays, match_count, details)
+        results.append((row, prediction, distances, neighbors, details or {}))
+        offset = stop
+    return results
+
+
+def load_saved_match(path, row, features, info, sources, arrays, match_count, method):
+    """Resume an atomically written match without repeating exhaustive retrieval."""
+    _, ids, grid = foreground_patches(features, row["image_path"], info["foreground_minimum"])
+    with np.load(path, allow_pickle=False) as stored:
+        required = {"distances", "neighbors"}
+        if not required <= set(stored.files):
+            raise ValueError(f"Incomplete Stage 2 match: {path}")
+        distance_map = stored["distances"]
+        neighbor_map = stored["neighbors"]
+        if distance_map.shape != grid or neighbor_map.shape != grid:
+            raise ValueError(f"Stage 2 match grid changed: {path}")
+        details = None
+        if method == "topk":
+            keys = {"candidate_ids", "weights", "nearest_distances", "topk_distances", "query_patch_ids"}
+            if not keys <= set(stored.files) or not np.array_equal(stored["query_patch_ids"], ids):
+                raise ValueError(f"Incomplete Stage 2 Top-K evidence: {path}")
+            details = {key: stored[key] for key in keys if key != "query_patch_ids"}
+            count = max(1, math.ceil(len(ids) * info["top_fraction"]))
+            details["scores"] = {
+                "nearest": float(np.sort(details["nearest_distances"])[-count:].mean()),
+                "topk": float(np.sort(details["topk_distances"])[-count:].mean()),
+            }
+    prediction, _, _ = summarize_match(distance_map.reshape(-1)[ids], neighbor_map.reshape(-1)[ids],
+                                       ids, grid, info, sources, arrays, match_count, details)
+    return prediction
+
+
+def write_evaluation_plot(calibrated, tested, threshold, destination):
+    """Write ROC, precision-recall, and anomaly-score distributions."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from sklearn.metrics import (average_precision_score, precision_recall_curve,
+                                 roc_auc_score, roc_curve)
+
+    labels = np.asarray([row["label"] for row in tested])
+    scores = np.asarray([row["score"] for row in tested])
+    fpr, tpr, _ = roc_curve(labels, scores)
+    precision, recall, _ = precision_recall_curve(labels, scores)
+    figure, axes = plt.subplots(1, 3, figsize=(16, 4.8), constrained_layout=True)
+    axes[0].plot(fpr, tpr, label=f"AUROC={roc_auc_score(labels, scores):.4f}")
+    axes[0].plot([0, 1], [0, 1], "--", color="gray", linewidth=1)
+    axes[0].set(title="ROC curve", xlabel="False positive rate", ylabel="True positive rate",
+                xlim=(0, 1), ylim=(0, 1))
+    axes[0].legend()
+    axes[1].plot(recall, precision, label=f"AP={average_precision_score(labels, scores):.4f}")
+    axes[1].axhline(labels.mean(), linestyle="--", color="gray", linewidth=1,
+                    label=f"prevalence={labels.mean():.4f}")
+    axes[1].set(title="Precision-recall curve", xlabel="Recall", ylabel="Precision",
+                xlim=(0, 1), ylim=(0, 1))
+    axes[1].legend()
+    axes[2].hist([scores[labels == 0], scores[labels == 1]], bins=60, density=True,
+                 label=("evaluation real", "evaluation fake"), color=("#2070b4", "#d9483b"), alpha=.65)
+    calibration_scores = np.asarray([row["score"] for row in calibrated])
+    axes[2].hist(calibration_scores, bins=60, density=True, histtype="step", linewidth=1.5,
+                 label="calibration real", color="black")
+    axes[2].axvline(threshold, linestyle="--", color="black", label=f"threshold={threshold:.4f}")
+    axes[2].set(title="Anomaly-score distribution", xlabel="Image anomaly score", ylabel="Density")
+    axes[2].legend()
+    for axis in axes:
+        axis.grid(alpha=.15)
+    figure.savefig(destination / "evaluation_analysis.png", dpi=180)
+    plt.close(figure)
 
 
 def evaluate(plan, args, bank, cache, output):
     info, sources, arrays = load_index(plan, bank, output)
     method = getattr(args, "method", "nearest")
-    attention = None
-    if method == "cross_attention":
-        from script.bank_attention import attention_info
-        attention = attention_info(output)
-    stage2 = output / "stage2"
+    stage1 = stage1_output(output)
+    stage2 = stage2_output(output)
     stage2.mkdir(parents=True, exist_ok=True)
     bank_families = {row["group_id"] for row in sources}
     calibration = image_records(plan["groups"]["calibration"], "calibration")
@@ -167,24 +197,31 @@ def evaluate(plan, args, bank, cache, output):
                 search = PatchBank(arrays["features"], device, args.query_chunk_size, args.bank_chunk_size,
                                    progress=loaded)
             else:
-                from script.bank_attention import ReferenceBank, load_attention
-                model = load_attention(attention, device) if attention else None
-                search = ReferenceBank(arrays["features"], device, args.query_chunk_size, args.bank_chunk_size,
-                                       args.attention, model=model, progress=loaded)
+                search = TopKPatchBank(arrays["features"], device, args.query_chunk_size,
+                                       args.bank_chunk_size, args.topk, progress=loaded)
             result = []
             def read(row):
                 return load_sample(cache / row["role"], row)[1]
             # Bound prefetched features rather than retaining the entire test set.
             for start in range(0, len(shard), 32):
                 batch = shard[start:start + 32]
-                for row, features in zip(batch, pool.map(read, batch)):
-                    prediction, distances, neighbors = match_image(features, row["image_path"], search,
-                                                                   info, sources, arrays, args.match_count)
+                features = list(pool.map(read, batch))
+                pending = []
+                for row, feature in zip(batch, features):
                     folder = stage2 / row["role"] / "patch_matches"
                     folder.mkdir(parents=True, exist_ok=True)
                     path = folder / f"{row['sample_id']:08d}.npz"
+                    if path.exists():
+                        prediction = load_saved_match(path, row, feature, info, sources, arrays,
+                                                      args.match_count, method)
+                        result.append(dict(row, **prediction, patch_matches=str(path.resolve())))
+                    else:
+                        pending.append((row, feature))
+                for row, prediction, distances, neighbors, details in match_batch(
+                        pending, search, info, sources, arrays, args.match_count) if pending else ():
+                    folder = stage2 / row["role"] / "patch_matches"
+                    path = folder / f"{row['sample_id']:08d}.npz"
                     temporary = path.with_suffix(".tmp.npz")
-                    details = getattr(search, "details", {})
                     np.savez(temporary, distances=distances, neighbors=neighbors,
                              **{key: value for key, value in details.items() if key != "scores"})
                     temporary.replace(path)
@@ -202,7 +239,7 @@ def evaluate(plan, args, bank, cache, output):
     write_json(stage2 / "calibration_scores.json", calibrated)
     write_json(stage2 / "evaluation_scores.json", tested)
     write_json(stage2 / "thresholds.json", {"threshold": threshold, "quantile": args.threshold_quantile,
-               "calibration_count": len(calibrated), "retrieval_sha256": sha256(output / "stage1/retrieval.json")})
+               "calibration_count": len(calibrated), "retrieval_sha256": sha256(stage1 / "retrieval.json")})
     comparison = {}
     if method != "nearest":
         for name in tested[0]["comparison_scores"]:
@@ -210,12 +247,12 @@ def evaluate(plan, args, bank, cache, output):
             comparison[name] = metrics([dict(r, score=r["comparison_scores"][name]) for r in tested], cutoff)
         write_json(stage2 / "comparison.json", dict(
             protocol="Development comparison on the existing evaluation split; not an untouched final test",
-            methods=comparison, retrieval_sha256=sha256(output / "stage1/retrieval.json"),
-            attention_sha256=sha256(output / "stage1/attention.json") if attention else None))
+            methods=comparison, retrieval_sha256=sha256(stage1 / "retrieval.json")))
     report = {"protocol": plan["protocol"], "method": info["method"] if method == "nearest" else method,
               "bank_images": info["image_count"], "bank_patches": info["patch_count"],
               "image": metrics(tested, threshold), **({"comparison": comparison} if comparison else {})}
     write_json(stage2 / "metrics.json", report)
+    write_evaluation_plot(calibrated, tested, threshold, stage2)
     result = report["image"]
     print(f"Stage 2 完成：AUROC={result['auroc']:.4f} AP={result['average_precision']:.4f} "
           f"FPR={result['false_positive_rate']:.4f} TPR={result['true_positive_rate']:.4f}\n"
@@ -239,9 +276,8 @@ def evaluate_ablation(plan, args, bank, cache, output):
     with ThreadPoolExecutor(max_workers=args.workers) as pool, tqdm(
             total=len(rows), desc="邊界／家族多樣性消融", unit="image", dynamic_ncols=True, mininterval=.5) as progress:
         def worker(shard, device):
-            from script.bank_attention import ReferenceBank
-            reference = ReferenceBank(arrays["features"], device, args.query_chunk_size,
-                                      args.bank_chunk_size, args.attention, families=patch_families)
+            reference = TopKPatchBank(arrays["features"], device, args.query_chunk_size,
+                                      args.bank_chunk_size, args.topk, families=patch_families)
             result = []
             def read(row):
                 return load_sample(cache / row["role"], row)[1]
@@ -249,7 +285,7 @@ def evaluate_ablation(plan, args, bank, cache, output):
                 batch = shard[start:start + 32]
                 for row, features in zip(batch, pool.map(read, batch)):
                     selected, ids, grid = foreground_patches(features, row["image_path"], info["foreground_minimum"])
-                    match_path = output / "stage2" / row["role"] / "patch_matches" / f"{row['sample_id']:08d}.npz"
+                    match_path = stage2_output(output) / row["role"] / "patch_matches" / f"{row['sample_id']:08d}.npz"
                     with np.load(match_path, allow_pickle=False) as matched:
                         if not {"candidate_ids", "query_patch_ids", "topk_distances"} <= set(matched.files):
                             raise ValueError(f"Stage 2 Top-K evidence missing: {match_path}")
@@ -281,15 +317,15 @@ def evaluate_ablation(plan, args, bank, cache, output):
         thresholds[name] = threshold
         methods[name] = metrics([dict(row, score=row["scores"][name]) for row in tested], threshold)
     kept = np.array([row["mean_kept_candidates"] for row in results])
-    directory = output / "ablations/boundary_family"
+    directory = stage2_output(output) / "ablations/boundary_family"
     write_json(directory / "scores.json", results)
     write_json(directory / "report.json", {
         "protocol": "Fixed one-shot development ablation on the existing evaluation split; not final test",
-        "settings": dict(ablation, candidate_scope=f"existing_top_{args.attention['neighbors']}"),
+        "settings": dict(ablation, candidate_scope=f"existing_top_{args.topk['neighbors']}"),
         "methods": methods, "thresholds": thresholds,
         "kept_candidates_per_patch": {"mean": float(kept.mean()), "minimum_image_mean": float(kept.min()),
                                       "maximum_image_mean": float(kept.max())},
-        "retrieval_sha256": sha256(output / "stage1/retrieval.json"),
+        "retrieval_sha256": sha256(stage1_output(output) / "retrieval.json"),
         "source_count": len(sources), "bank_patches": int(len(arrays["features"])),
     })
     print("消融完成：" + " ".join(f"{name}={value['auroc']:.4f}" for name, value in methods.items())

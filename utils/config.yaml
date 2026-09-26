@@ -1,45 +1,16 @@
-# 專案環境與表徵提取參數；命令列參數優先於此檔案。
+# 專案環境與實驗參數；命令列參數優先於此檔案。
 # 相對路徑以專案根目錄為基準，絕對路徑則直接使用。
-data_root: /ssd2/DeepFakes/celeb-df-video
 model_path: models/dinov3-vitb16-pretrain-lvd1689m
-output_dir: outputs/features
-
-device: cpu  # GPU 範例：cuda:0
-num_frames: 32
-batch_size: 8
-split: all  # all / train / test
-limit: null  # null 表示不限制影片數量；需要少量執行時可設為 1
-overwrite: false
-
-# AUC 改善實驗：自動建立／沿用原始 DINO NPY，不沿用看過全部 training 的 adapter。
-# real 統計建模＋少量 fake 輔助線性評分；這是弱監督，不是純 real-only。
-bank_probe:
-  source_experiment: null  # null：從 JPG 建立與 --exper 同名的來源；有快取可指定舊名稱
-  experiment: null  # 請自行填入名稱，或啟動時使用 --exper 指定；不自動命名
-  bank_dir: /ssd8/chihyu/Project/DeepFakeSecurity/RAG/normal
-  cache_dir: RAG/cache  # fake／校準／測試 NPY 分開存，不混入 normal bank
-  results_dir: outputs/feature_bank
-  seed: 73
-  validation_fraction: 0.2  # 僅從原 training 抽 source-family-disjoint 驗證組
-  fake_videos: 40  # 每個來源 family 至多選一支；0 只比較 real 統計距離
-  fake_weight: 0.1  # fake 每支影片對評分器的權重為 real 的 10%
-  regularization: [0.001, 0.01, 0.1]  # 固定候選，僅以內部驗證 AUROC 選型
-  threshold_quantile: 0.99  # 閾值只用原 calibration real 決定
-  cpu_threads: 4  # CPU 數值運算的執行緒上限
-  workers: 8  # 平行讀取 NPY/JPG；保持原始樣本順序
-  extract_batch_size: 8  # 每張 GPU 的 DINO 提取 batch；記憶體不足時調小
-  gpu_ids: [1, 2]  # 每張 GPU 一個候選模型工作執行緒；[] 使用 CPU
 
 # 當前實驗：bash run.sh stage1/stage2 --exper FB_01
 # 直接查詢 real patch bank；無分類器訓練，train_fake 保留切分但不使用。
 retrieval:
-  experiment: null  # LoRA 會產生全新表徵，請自行填入新名稱；Stage 1／Stage 2 共用
+  experiment: null  # Encoder tuning 會產生全新表徵，請自行填入新名稱；Stage 1／Stage 2 共用
   face_source: segface  # segface：純臉遮罩 JPG；retinaface：原始 224x224 人臉框
-  method: topk  # 以 real bank Top-K cosine 相似度判斷；cross_attention 僅保留作消融
+  method: topk  # 以 real bank Top-K cosine 加權重建誤差判斷
   encoder_tuning:
-    enabled: true  # 最後一個 DINOv3 block 的 Q/K/V 加 LoRA；原始模型保持凍結
-    rank: 8
-    alpha: 8.0
+    enabled: true
+    unfreeze_blocks: 4  # 建議先比較 2 與 4；預設解凍 ViT-B/16 最後 4/12 blocks
     epochs: 20
     patience: 5  # validation loss 連續 5 個 epoch 未改善即停止
     minimum_delta: 0.00001
@@ -47,48 +18,36 @@ retrieval:
     images_per_epoch: 512  # 每輪 family-disjoint training real 的抽樣上限
     validation_images: 128
     validation_fraction: 0.2
-    learning_rate: 0.00001
-    weight_decay: 0.0001
-    anchor_weight: 1.0  # 約束新表徵不要偏離原始 DINOv3
-    compression:
-      mild_quality: [65, 90]  # 類似 UMCL 較輕壓縮分支；JPEG quality 並不等同 H.264 CRF
-      severe_quality: [30, 55]  # 類似較重壓縮分支
-      mild_scale: 0.75  # 先縮小再還原，模擬解析度與編碼資訊損失
-      severe_scale: 0.5
-      affinity_weight: 0.1  # 對齊不同品質下 patch-to-patch 關係
-    local_anomaly:
-      quality: [10, 35]  # 僅在局部區域製造強 JPEG／縮放／色彩 discrepancy
-      scale: 0.35
-      minimum_fraction: 0.18
-      maximum_fraction: 0.35
-      mask_threshold: 0.25  # patch 中至少 25% 被修改才視為 pseudo anomaly
-      margin: 0.1  # 修改區域與原 real patch 的最小 cosine distance
-      weight: 0.5
-      background_weight: 1.0  # 未修改區域必須保持接近
-    fake_interval: 5  # 每 5 個 real batch 才加入一次 fake margin
-    fake_batch_size: 2
-    fake_weight: 0.0  # real-only feature bank 預設不使用真實 fake；大於 0 才啟用
-    fake_margin: 0.1
+    backbone_learning_rate: 0.000002
+    decoder_learning_rate: 0.0001
+    weight_decay: 0.05
+    ema_weight: 0.1
+    ema_start: 0.996
+    ema_end: 1.0
+    fsfm:
+      image_size: 224
+      grid_size: 14  # DINOv3 ViT-B/16 在 224x224 輸入的 patch 網格
+      mask_ratio: 0.75  # 原 FSFM 使用 75% CRFR-P masking
+      foreground_minimum: 0.25  # 僅對 SegFace 非黑色 patch 取樣遮罩
+      parser_batch_size: 4  # 首次建立臉部區域快取時的 SegFace batch
+      decoder_layers: 2
+      decoder_heads: 8
+      decoder_mlp_ratio: 2.0
+      decoder_dropout: 0.1
+      region_weight: 0.25  # 完整遮住之臉部區域的額外重建權重
+      global_weight: 0.1  # masked local representation 與完整臉部表徵的一致性
     gradient_clip: 1.0
-  attention:
+  topk:
     neighbors: 16  # 先檢索 Top-K real patches，再做注意力加權
     temperature: 0.07  # 不需訓練的 Top-K cosine softmax 基準
-    hidden: 128
-    heads: 4
-    epochs: 30  # 最大訓練輪數；只訓練 Q/K 投影
-    patience: 5  # real validation loss 連續 5 輪未改善即停止
-    batch_size: 256  # 多 GPU 合計的 patch batch
-    patches_per_image: 32
-    validation_fraction: 0.2  # bank real 內按來源家族切分
-    learning_rate: 0.001
-    weight_decay: 0.0001
-    noise_std: 0.02  # 訓練 query 擾動，目標保留乾淨 DINO 特徵
   ablation:
     boundary_weight: 0.5  # 前景遮罩邊界 patch 的異常證據權重
     max_per_family: 2  # 在既有 Top-16 內，每個來源家族最多保留 2 個候選
   export_previews: false  # 選用 PCA／JPG 預覽；關閉可省去視覺化與重讀 NPY 的時間
-  bank_dir: /ssd8/chihyu/Project/DeepFakeSecurity/RAG/normal
-  results_dir: /ssd8/chihyu/Project/DeepFakeSecurity/outputs/feature_bank
+  # Stage 1 與 Stage 2 特徵分開保存；兩者都會再建立 <experiment>/ 子目錄。
+  bank_dir: /ssd8/chihyu/Dataset/DeepFake_Dataset/RAG/DFDC/Stage1_Real_Feature_Bank
+  stage2_cache_dir: /ssd8/chihyu/Dataset/DeepFake_Dataset/RAG/DFDC/Stage2_Query_Feature_Cache
+  results_dir: /ssd8/chihyu/Project/Real-Only-DINOv3-PatchBank-for-Deepfake-Detection/outputs/DFDC
   seed: 42  # 沿用前次全量實驗的來源家族切分
   gpu_ids: [4, 5, 6]
   workers: 16
@@ -112,7 +71,7 @@ mission:
 
 # 對 RetinaFace 輸出做語意臉部分割、遮罩擴張與去背景裁切。
 segment_face:
-  input_dir: /ssd8/chihyu/Dataset/DeepFake_Dataset/DFDC
+  input_dir: /ssd8/chihyu/Dataset/DeepFake_Dataset/DFDC-Frame-Face
   normal_output_dir: /ssd8/chihyu/Dataset/DeepFake_Dataset/DFDC-SegFace-normal
   anomaly_output_dir: /ssd8/chihyu/Dataset/DeepFake_Dataset/DFDC-SegFace-anomaly
   parser_model: SegFace-SwinB-CelebAMaskHQ-512
@@ -141,8 +100,8 @@ crop_face:
   data_root: /ssd2/DeepFakes/deepFakeChallenge
   label_csv: /ssd2/DeepFakes/DFDC_list/test.csv  # null 時使用 Celeb-DF 官方切分
   split: test
-  output_dir: /ssd8/chihyu/Dataset/DeepFake_Dataset/DFDC
-  cache_dir: outputs/retinaface_cache  # 首次執行自動下載 RetinaFace 權重
+  output_dir: /ssd8/chihyu/Dataset/DeepFake_Dataset/DFDC-Frame-Face
+  cache_dir: outputs/preprocessing/retinaface_cache  # 首次執行自動下載 RetinaFace 權重
   device: cpu  # cpu 或 cuda:0；多個工作會共用指定的 GPU
   gpu_ids: [5]  # 目前預設使用 GPU 5；執行前可依當下負載調整
   workers: 8  # CPU／單 GPU 的程序數；gpu_ids 非空時固定每張 GPU 一個程序
